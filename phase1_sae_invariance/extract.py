@@ -28,7 +28,12 @@ def load_model(cfg: Phase1Config):
     # to be installed.
     from sae_lens import HookedSAETransformer
 
-    model = HookedSAETransformer.from_pretrained_no_processing(cfg.model_name, device=cfg.device)
+    torch_dtype = getattr(torch, cfg.dtype)
+
+    model = HookedSAETransformer.from_pretrained_no_processing(
+        cfg.model_name, device=cfg.device, dtype=torch_dtype
+    )
+    
     return model
 
 

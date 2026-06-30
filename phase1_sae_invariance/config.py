@@ -18,6 +18,7 @@ class Phase1Config:
     # --- Model ---
     model_name: str = "gemma-2-2b"   # TransformerLens / HookedSAETransformer name
     device: str = "cuda"              # "cuda" or "cpu"
+    dtype: str = "bfloat16"           # "bfloat16" (recommended), "float32", or "float16"
 
     # --- SAEs (Gemma Scope, canonical residual-stream release) ---
     sae_release: str = "gemma-scope-2b-pt-res-canonical"
