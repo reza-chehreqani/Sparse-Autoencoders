@@ -136,5 +136,5 @@ TRAIN_CONFIG = dict(
     eval_batch_size=32,           # padded batch size for evaluate.py's forward passes;
                                     # unrelated to batch_size_lm/batch_size_invariance above,
                                     # which are training-step sizes processed unbatched
-    output_dir="results/step2_llm",
+    output_dir="results",
 )
