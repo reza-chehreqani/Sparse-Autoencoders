@@ -71,6 +71,9 @@ class FrozenSAE:
         harm than good. If you know your SAE's architecture and want a
         sparsity term too, this is the place to add it.
         """
+        if self._should_center:
+            acts = acts - acts.mean(dim=-1, keepdim=True)
+            
         codes = self.encode(acts)
         recon = self.decode(codes)
         return torch.nn.functional.mse_loss(recon, acts)
