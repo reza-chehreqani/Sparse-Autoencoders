@@ -1,15 +1,27 @@
 """
-Re-runs Step 1's exact measurement pipeline (same metrics, same PAWS test split,
-same encode-then-pool-then-compare protocol) on either the pretrained baseline
-or a trained LoRA checkpoint, across every layer. This is what makes the
-before/after comparison meaningful: the identical measurement applied to data
-the model never saw during training (the test split), before and after training
-changes anything.
+Re-runs Step 1's exact measurement pipeline (same metrics, same PAWS test
+split, same encode-then-pool-then-compare protocol) on either the pretrained
+baseline or a trained LoRA checkpoint, across every layer. This is what makes
+the before/after comparison meaningful: the identical measurement applied to
+data the model never saw during training (the test split), before and after
+training changes anything.
+
+Activations for every layer are computed from a single set of batched,
+torch.no_grad()-wrapped forward passes over each sentence list (see
+hooked_activations.get_pooled_activations_for_eval for why this specific
+combination matters at evaluation scale) -- the per-layer loop below does only
+cheap tensor arithmetic on the already-computed pooled vectors, no further
+model forward passes.
 
 Usage:
     python evaluate.py --model gpt2-small --run_id baseline
     python evaluate.py --model gpt2-small --run_id gpt2-small__C3_sae_magnitude__lam1.0 \
         --adapter_path results/step2_llm/gpt2-small__C3_sae_magnitude__lam1.0/adapter
+
+    # a --joint_sae training run's SAE checkpoint is picked up automatically
+    # from trained_sae/ alongside the adapter -- no extra flag needed here:
+    python evaluate.py --model gpt2-small --run_id gpt2-small__C4_sae_magnitude_support__lam1.0__jointsae \
+        --adapter_path results/step2_llm/gpt2-small__C4_sae_magnitude_support__lam1.0__jointsae/adapter
 """
 
 import argparse
@@ -17,13 +29,13 @@ import json
 import os
 from dataclasses import asdict
 
-import numpy as np
 import torch
-from tqdm import tqdm
 
 from config import MODEL_CONFIGS, PAWS_CONFIG, TRAIN_CONFIG
+from frozen_sae import load_all_layer_saes
 from hf_model_loading import load_model_for_eval, load_tokenizer, resolve_device
 from hooked_activations import get_multi_layer_activations
+from losses import pool_raw_activations, pool_sae_codes
 from metrics import (
     LayerStats,
     cosine_distance,
@@ -32,19 +44,9 @@ from metrics import (
     support_jaccard_distance,
 )
 from pairs_dataset import load_paws_split
-from frozen_sae import load_all_layer_saes
 
 
 @torch.no_grad()
-def pool_sae_codes(sae, per_sentence_acts: list[torch.Tensor]) -> torch.Tensor:
-    return torch.stack([sae.encode(a).mean(dim=0) for a in per_sentence_acts], dim=0)
-
-
-@torch.no_grad()
-def pool_raw_activations(per_sentence_acts: list[torch.Tensor]) -> torch.Tensor:
-    return torch.stack([a.mean(dim=0) for a in per_sentence_acts], dim=0)
-
-
 def evaluate_checkpoint(model_key: str, run_id: str, adapter_path: str | None) -> None:
     model_cfg = MODEL_CONFIGS[model_key]
     device = resolve_device(TRAIN_CONFIG["device"])
@@ -54,6 +56,21 @@ def evaluate_checkpoint(model_key: str, run_id: str, adapter_path: str | None) -
 
     print(f"[{model_key}] loading SAEs ...")
     saes = load_all_layer_saes(model_cfg, device)
+
+    if adapter_path is not None:
+        # A run trained with --joint_sae saves its SAE state alongside the
+        # adapter, at <run_dir>/trained_sae/layer_<l>.pt. If that directory
+        # exists, overlay those weights on top of the fresh pretrained SAEs so
+        # this evaluates the model with the SAE it actually finished training
+        # with -- not a mismatched fresh one. Layers that weren't part of that
+        # run's invariance loss (and so were never trained) keep the fresh,
+        # pretrained SAE, which is correct since nothing changed them either way.
+        sae_dir = os.path.join(os.path.dirname(adapter_path.rstrip("/")), "trained_sae")
+        if os.path.isdir(sae_dir):
+            for fname in os.listdir(sae_dir):
+                layer = int(fname.removeprefix("layer_").removesuffix(".pt"))
+                print(f"[{model_key}] found trained SAE for layer {layer} at {sae_dir}/{fname}, using it instead of the pretrained one")
+                saes[layer].load_trained_state(os.path.join(sae_dir, fname), device)
 
     print(f"[{model_key}] loading model (adapter={adapter_path or 'none -- pretrained baseline'}) ...")
     tokenizer = load_tokenizer(model_cfg)
@@ -74,12 +91,11 @@ def evaluate_checkpoint(model_key: str, run_id: str, adapter_path: str | None) -
     def pooled(sentences: list[str]):
         raw_chunks: dict[int, list[torch.Tensor]] = {layer: [] for layer in all_layers}
         sae_chunks: dict[int, list[torch.Tensor]] = {layer: [] for layer in all_layers}
-        for start in tqdm(range(0, len(sentences), eval_batch_size), desc="Pooling sentences", total=len(sentences) // eval_batch_size):
+        for start in range(0, len(sentences), eval_batch_size):
             batch = list(sentences[start : start + eval_batch_size])
-            with torch.no_grad():
-                acts = get_multi_layer_activations(
-                    hf_model, tokenizer, batch, all_layers, model_cfg.model_family, model_cfg.hook_side, device
-                )
+            acts = get_multi_layer_activations(
+                hf_model, tokenizer, batch, all_layers, model_cfg.model_family, model_cfg.hook_side, device
+            )
             for layer in all_layers:
                 raw_chunks[layer].append(pool_raw_activations(acts[layer]).cpu())
                 sae_chunks[layer].append(pool_sae_codes(saes[layer], acts[layer]).cpu())
@@ -97,13 +113,13 @@ def evaluate_checkpoint(model_key: str, run_id: str, adapter_path: str | None) -
     per_layer_raw_records = []
 
     for layer in all_layers:
-        raw_cos_same = cosine_distance(raw_a_same[layer], raw_b_same[layer]).float().numpy()
-        raw_cos_diff = cosine_distance(raw_a_diff[layer], raw_b_diff[layer]).float().numpy()
-        sae_cos_same = cosine_distance(sae_a_same[layer], sae_b_same[layer]).float().numpy()
-        sae_cos_diff = cosine_distance(sae_a_diff[layer], sae_b_diff[layer]).float().numpy()
-        sae_jacc_same = support_jaccard_distance(sae_a_same[layer], sae_b_same[layer], tau).float().numpy()
-        sae_jacc_diff = support_jaccard_distance(sae_a_diff[layer], sae_b_diff[layer], tau).float().numpy()
-        support_diff_matrix = ((sae_a_diff[layer] > tau) ^ (sae_b_diff[layer] > tau)).float().numpy()
+        raw_cos_same = cosine_distance(raw_a_same[layer], raw_b_same[layer]).numpy()
+        raw_cos_diff = cosine_distance(raw_a_diff[layer], raw_b_diff[layer]).numpy()
+        sae_cos_same = cosine_distance(sae_a_same[layer], sae_b_same[layer]).numpy()
+        sae_cos_diff = cosine_distance(sae_a_diff[layer], sae_b_diff[layer]).numpy()
+        sae_jacc_same = support_jaccard_distance(sae_a_same[layer], sae_b_same[layer], tau).numpy()
+        sae_jacc_diff = support_jaccard_distance(sae_a_diff[layer], sae_b_diff[layer], tau).numpy()
+        support_diff_matrix = ((sae_a_diff[layer] > tau) ^ (sae_b_diff[layer] > tau)).numpy()
 
         auroc_raw, p_raw = discrimination_auroc(raw_cos_same, raw_cos_diff)
         auroc_sae, p_sae = discrimination_auroc(sae_cos_same, sae_cos_diff)

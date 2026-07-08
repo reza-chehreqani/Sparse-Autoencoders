@@ -1,21 +1,33 @@
 """
 Trains one (model, condition, lambda) combination for Step 2.
 
-Each step draws one WikiText batch and (for C2-C4) one PAWS same-meaning batch,
-and combines both into a single backward pass:
+Each step draws one WikiText batch and (for C2-C4) one PAWS same-meaning batch
+AND one PAWS diff-meaning batch, combining all of it into a single backward pass:
 
-    total_loss = lm_loss(wikitext_batch) + lambda * invariance_loss(paws_batch)
+    total_loss = lm_loss(wikitext_batch)
+               + lambda * [ attractive(same_batch) + repulsive(diff_batch) (+ support) ]
+               + (only with --joint_sae) sae_recon_loss_weight * reconstruction_loss(...)
 
-Produces, under results/step2_llm/<model>__<condition>__lam<lambda>/:
-  - adapter/            the trained LoRA adapter (not the full model)
-  - training_log.json   periodic validation checks: LM perplexity, SAE-space
-                         same/diff AUROC (the collapse check -- this should
-                         WIDEN over training, not shrink), mean same/diff
-                         SAE-cosine-distance, and SAE reconstruction variance
-                         explained (the frozen-SAE-drift check).
+See losses.py for why the repulsive term uses a margin/hinge rather than an
+unbounded "maximize distance" objective, and frozen_sae.py for why joint SAE
+training needs the reconstruction-loss anchor to avoid a trivial collapsed
+solution.
+
+Produces, under results/step2_llm/<model>__<condition>__lam<lambda>[__jointsae]/:
+  - adapter/               the trained LoRA adapter (not the full model)
+  - trained_sae/            (only with --joint_sae) one state dict per invariance
+                            layer's SAE, as it ended training -- evaluate.py picks
+                            these up automatically if present for a given run_id
+  - training_log.json      periodic validation checks: LM perplexity, SAE-space
+                            same/diff AUROC (the collapse check -- this should
+                            WIDEN over training, not shrink), mean same/diff
+                            SAE-cosine-distance, SAE reconstruction variance
+                            explained (the frozen-SAE-drift check), and the
+                            attractive/repulsive/support loss components.
 
 Usage:
     python train.py --model gpt2-small --condition C3_sae_magnitude --lam 1.0
+    python train.py --model gpt2-small --condition C4_sae_magnitude_support --lam 1.0 --joint_sae
 """
 
 import argparse
@@ -24,14 +36,13 @@ import os
 import random
 
 import torch
-from tqdm import tqdm
 
 from config import CONDITION_SPECS, INVARIANCE_LAYERS, MODEL_CONFIGS, PAWS_CONFIG, TRAIN_CONFIG, WIKITEXT_CONFIG
 from frozen_sae import load_layer_saes
 from hf_model_loading import load_lora_model, load_tokenizer, resolve_device
 from hooked_activations import get_multi_layer_activations
 from lm_dataset import WikiTextBatcher, load_wikitext_train_text
-from losses import invariance_loss, lm_loss, pool_sae_codes_for_training
+from losses import invariance_loss, lm_loss, pool_sae_codes
 from metrics import cosine_distance, discrimination_auroc
 from pairs_dataset import load_paws_split
 
@@ -101,15 +112,13 @@ def run_validation_checks(
 
     sae = saes[layer]
     same_cos = (
-        cosine_distance(pool_sae_codes_for_training(sae, acts["a_same"]), pool_sae_codes_for_training(sae, acts["b_same"]))
+        cosine_distance(pool_sae_codes(sae, acts["a_same"]), pool_sae_codes(sae, acts["b_same"]))
         .cpu()
-        .float()
         .numpy()
     )
     diff_cos = (
-        cosine_distance(pool_sae_codes_for_training(sae, acts["a_diff"]), pool_sae_codes_for_training(sae, acts["b_diff"]))
+        cosine_distance(pool_sae_codes(sae, acts["a_diff"]), pool_sae_codes(sae, acts["b_diff"]))
         .cpu()
-        .float()
         .numpy()
     )
     auroc_sae, _ = discrimination_auroc(same_cos, diff_cos)
@@ -127,24 +136,37 @@ def run_validation_checks(
     )
 
 
-def run(model_key: str, condition: str, lam: float, seed: int = 0) -> None:
+def run(model_key: str, condition: str, lam: float, joint_sae: bool, seed: int = 0) -> None:
     torch.manual_seed(seed)
     model_cfg = MODEL_CONFIGS[model_key]
     spec = CONDITION_SPECS[condition]
     inv_layers = INVARIANCE_LAYERS[model_key]
     device = resolve_device(TRAIN_CONFIG["device"])
+    tag = f"[{model_key}/{condition}/lam={lam}{'/joint_sae' if joint_sae else ''}]"
 
-    print(f"[{model_key}/{condition}/lam={lam}] loading SAEs ...")
+    # if joint_sae and not spec["use_invariance"]:
+    #     print(f"{tag} --joint_sae has no effect on {condition}: it never uses the SAE in its loss. Proceeding without it.")
+    #     joint_sae = False
+    # if joint_sae and spec["space"] != "sae":
+    #     print(f"{tag} --joint_sae has no effect on {condition}: its invariance loss is computed in raw space, "
+    #           f"not through the SAE. Proceeding without it.")
+    #     joint_sae = False
+
+    print(f"{tag} loading SAEs ...")
     saes = load_layer_saes(model_cfg, device, inv_layers)
+    if joint_sae:
+        for l in inv_layers:
+            saes[l].make_trainable()
 
-    print(f"[{model_key}/{condition}/lam={lam}] loading LoRA model ...")
+    print(f"{tag} loading LoRA model ...")
     tokenizer = load_tokenizer(model_cfg)
     peft_model = load_lora_model(model_cfg, TRAIN_CONFIG, device)
     hf_model = peft_model.get_base_model()
 
-    print(f"[{model_key}/{condition}/lam={lam}] loading data ...")
+    print(f"{tag} loading data ...")
     train_pairs = load_paws_split(**_paws_split_kwargs("train"))
     train_same = [p for p in train_pairs if p.same_meaning]
+    train_diff = [p for p in train_pairs if not p.same_meaning]
     val_pairs = load_paws_split(**_paws_split_kwargs("validation"))
     val_same = [p for p in val_pairs if p.same_meaning]
     val_diff = [p for p in val_pairs if not p.same_meaning]
@@ -157,31 +179,62 @@ def run(model_key: str, condition: str, lam: float, seed: int = 0) -> None:
         wikitext_texts[-200:], tokenizer, WIKITEXT_CONFIG["max_seq_len"], device, seed=seed + 1
     )
 
-    optimizer = torch.optim.AdamW([p for p in peft_model.parameters() if p.requires_grad], lr=TRAIN_CONFIG["learning_rate"])
+    param_groups = [dict(params=[p for p in peft_model.parameters() if p.requires_grad], lr=TRAIN_CONFIG["learning_rate"])]
+    if joint_sae:
+        sae_params = [p for l in inv_layers for p in saes[l].parameters()]
+        param_groups.append(dict(params=sae_params, lr=TRAIN_CONFIG["sae_learning_rate"]))
+    optimizer = torch.optim.AdamW(param_groups)
 
     rng_state: dict = {}
     log = []
-    for step in tqdm(range(TRAIN_CONFIG["max_steps"]), desc="Training steps", total=TRAIN_CONFIG["max_steps"]):
+    for step in range(TRAIN_CONFIG["max_steps"]):
         lm_batch = wikitext_train_batcher.next_batch(TRAIN_CONFIG["batch_size_lm"])
         loss_lm = lm_loss(peft_model, lm_batch)
 
         if spec["use_invariance"]:
             same_batch = sample_batch(train_same, TRAIN_CONFIG["batch_size_invariance"], rng_state, "train_same")
-            sentences_a = [p.sentence_a for p in same_batch]
-            sentences_b = [p.sentence_b for p in same_batch]
-            acts_a = get_multi_layer_activations(
-                hf_model, tokenizer, sentences_a, inv_layers, model_cfg.model_family, model_cfg.hook_side, device
+            diff_batch = sample_batch(train_diff, TRAIN_CONFIG["batch_size_invariance"], rng_state, "train_diff")
+
+            same_acts_a = get_multi_layer_activations(
+                hf_model, tokenizer, [p.sentence_a for p in same_batch], inv_layers,
+                model_cfg.model_family, model_cfg.hook_side, device,
             )
-            acts_b = get_multi_layer_activations(
-                hf_model, tokenizer, sentences_b, inv_layers, model_cfg.model_family, model_cfg.hook_side, device
+            same_acts_b = get_multi_layer_activations(
+                hf_model, tokenizer, [p.sentence_b for p in same_batch], inv_layers,
+                model_cfg.model_family, model_cfg.hook_side, device,
             )
-            loss_inv = sum(
-                invariance_loss(saes[l], acts_a[l], acts_b[l], spec["space"], spec["use_support_term"])
-                for l in inv_layers
+            diff_acts_a = get_multi_layer_activations(
+                hf_model, tokenizer, [p.sentence_a for p in diff_batch], inv_layers,
+                model_cfg.model_family, model_cfg.hook_side, device,
             )
+            diff_acts_b = get_multi_layer_activations(
+                hf_model, tokenizer, [p.sentence_b for p in diff_batch], inv_layers,
+                model_cfg.model_family, model_cfg.hook_side, device,
+            )
+
+            loss_inv = torch.tensor(0.0, device=device)
+            inv_components: dict = {}
+            for l in inv_layers:
+                l_total, l_components = invariance_loss(
+                    saes[l], same_acts_a[l], same_acts_b[l], diff_acts_a[l], diff_acts_b[l],
+                    spec["space"], spec["use_support_term"], TRAIN_CONFIG["repulsive_margin"],
+                )
+                loss_inv = loss_inv + l_total
+                for k, v in l_components.items():
+                    inv_components[f"layer{l}_{k}"] = v
+
             total_loss = loss_lm + lam * loss_inv
+
+            if joint_sae:
+                recon_loss = torch.tensor(0.0, device=device)
+                for l in inv_layers:
+                    all_acts = torch.cat(same_acts_a[l] + same_acts_b[l] + diff_acts_a[l] + diff_acts_b[l], dim=0)
+                    recon_loss = recon_loss + saes[l].reconstruction_loss(all_acts)
+                total_loss = total_loss + TRAIN_CONFIG["sae_recon_loss_weight"] * recon_loss
+                inv_components["sae_recon_loss"] = recon_loss.item()
         else:
             loss_inv = torch.tensor(0.0)
+            inv_components = {}
             total_loss = loss_lm
 
         optimizer.zero_grad()
@@ -193,7 +246,7 @@ def run(model_key: str, condition: str, lam: float, seed: int = 0) -> None:
                 peft_model, hf_model, tokenizer, saes, inv_layers, model_cfg.model_family, model_cfg.hook_side,
                 val_same, val_diff, wikitext_val_batcher, device,
             )
-            checks.update(step=step, loss_lm=float(loss_lm.item()), loss_inv=float(loss_inv.item()))
+            checks.update(step=step, loss_lm=float(loss_lm.item()), loss_inv=float(loss_inv.item()), **inv_components)
             log.append(checks)
             print(
                 f"  step {step}: lm_loss={checks['loss_lm']:.3f} inv_loss={checks['loss_inv']:.4f} "
@@ -202,10 +255,15 @@ def run(model_key: str, condition: str, lam: float, seed: int = 0) -> None:
                 f"sae_var_explained={checks['sae_variance_explained']:.3f}"
             )
 
-    run_id = f"{model_key}__{condition}__lam{lam}"
+    run_id = f"{model_key}__{condition}__lam{lam}" + ("__jointsae" if joint_sae else "")
     out_dir = os.path.join(TRAIN_CONFIG["output_dir"], run_id)
     os.makedirs(out_dir, exist_ok=True)
     peft_model.save_pretrained(os.path.join(out_dir, "adapter"))
+    if joint_sae:
+        sae_dir = os.path.join(out_dir, "trained_sae")
+        os.makedirs(sae_dir, exist_ok=True)
+        for l in inv_layers:
+            saes[l].save(os.path.join(sae_dir, f"layer_{l}.pt"))
     with open(os.path.join(out_dir, "training_log.json"), "w") as f:
         json.dump(log, f, indent=2)
     print(f"[{run_id}] done, saved to {out_dir}")
@@ -216,6 +274,9 @@ if __name__ == "__main__":
     parser.add_argument("--model", required=True, choices=list(MODEL_CONFIGS.keys()))
     parser.add_argument("--condition", required=True, choices=list(CONDITION_SPECS.keys()))
     parser.add_argument("--lam", type=float, default=1.0)
+    parser.add_argument("--joint_sae", action="store_true",
+                         help="Also train the invariance layer(s)' SAE, instead of keeping it frozen. "
+                              "Only meaningful for conditions whose invariance loss runs through the SAE (C3/C4).")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-    run(args.model, args.condition, args.lam, args.seed)
+    run(args.model, args.condition, args.lam, args.joint_sae, args.seed)

@@ -1,17 +1,36 @@
 # Step 2 (proof of concept) — language-model track
 
-Scope: GPT-2-small and Pythia-70m-deduped, continuing directly from Step 1.
-This is the first step in the whole project that actually trains anything
-(LoRA adapters); everything before it only measured frozen models.
+Scope: GPT-2-small, Pythia-70m-deduped, and Gemma-3-270m. This is the first
+step in the whole project that actually trains anything (LoRA adapters).
+
+Step 1 is no longer a separate prerequisite: `evaluate.py --run_id baseline`
+reproduces everything Step 1 measured (same metrics, same PAWS protocol,
+every layer) on the plain pretrained model before any training happens, and
+`analyze_and_plot.py`'s depth-profile plots come from that same baseline run.
+Layer selection (below) now comes from that baseline eval rather than a
+separate Step 1 codebase.
 
 ## Before running anything: fill in the real layer selection
 
-`config.py`'s `INVARIANCE_LAYERS` are **placeholders** (`[6]` for gpt2-small,
-`[3]` for pythia-70m-deduped). Replace them with whichever layer(s) showed the
-largest delta-AUROC in Step 1's `depth_profile.png` for each model. If two or
-three adjacent layers are close, list all of them — the loss sums over every
-layer listed. Running with the placeholders in place will produce results, but
-they won't mean anything until this is fixed.
+`config.py`'s `INVARIANCE_LAYERS` are **placeholders** (`[6]` gpt2-small,
+`[3]` pythia-70m-deduped, `[9]` gemma3-270m). Replace them with whichever
+layer(s) show the largest delta-AUROC in the baseline eval's depth profile for
+each model. If several adjacent layers are close, list all of them — the loss
+sums over every layer listed. Results with the placeholders in place don't
+mean anything until this is fixed.
+
+## Gemma-3-270m: what's confirmed vs. still open
+
+- **`hf_model_name`**: confirmed as `"google/gemma-3-270m"` (no `-pt` suffix
+  — the guessed `-pt` variant 404s).
+- **`n_layers`**: confirmed as 18 directly from the shape-check assertion.
+- **`d_model`**: still an open guess (640). The assertion checks `n_layers`
+  first and stops there if it fails, so it never got to check `d_model` yet —
+  next run either passes silently or reports the real value the same way.
+- **SAE `release`** (`gemma-scope-2-270m-pt-res-all`) and **`sae_id_template`**
+  (`"layer_{layer}_width_16k_l0_small"`): both confirmed working — the
+  original `sae_id` guess failed with a `ValueError` that listed every valid
+  ID for the release, which is where the correct format came from.
 
 ## The five conditions
 
@@ -23,86 +42,170 @@ they won't mean anything until this is fixed.
 | C3 SAE invariance, magnitude-only | pooled SAE codes | no | the core idea, without the sparsity-specific piece |
 | C4 SAE invariance, magnitude + support | pooled SAE codes | yes (soft-Dice) | tests whether the sparsity-aware term earns its keep over C3 |
 
-Run all five for both models — a second, stronger test of whether results
-generalize across architectures (H5), not just observationally as in Step 1.
+Run all five for all three models — a second, stronger test of whether
+results generalize across architectures (H5), not just observationally.
+
+## The invariance loss now has two components, not one
+
+Every condition with `use_invariance=True` (C2/C3/C4) now pulls same-meaning
+pairs together **and** pushes diff-meaning pairs apart, instead of only the
+former:
+
+```
+invariance_loss = attractive(same-meaning pairs)       # original term
+                 + repulsive(diff-meaning pairs)         # new
+                 + support(same-meaning pairs)            # C4 only, unchanged
+```
+
+The repulsive term is a margin/hinge loss (`losses.py`'s `invariance_loss`):
+zero once a diff-meaning pair is already `repulsive_margin` (default 0.5)
+cosine-distance apart, growing only as they get closer than that. This is
+what the decision gate previously called "an explicit repulsive term on
+diff-meaning pairs" as the fix for representational collapse — it's now
+built into every SAE/raw-space run rather than being a fallback to add later.
+A margin/hinge is used rather than an unbounded "maximize distance" objective
+specifically so the term goes to zero and stops fighting the LM loss once
+pairs are adequately separated, rather than pushing forever.
+
+**This changes what C2/C3/C4 compute compared to earlier runs.** If you have
+existing `results/step2_llm/` output from before this change, move or rename
+that directory before re-running — new runs reuse the same run_id naming and
+would land in the same folders, mixing two different loss formulations
+together under what looks like one consistent set of results.
+
+## Optional: jointly train the SAE (`--joint_sae`)
+
+By default the SAE stays frozen throughout training (gradients flow *through*
+it into the LoRA parameters, but never *into* its own weights — see
+`frozen_sae.py`). Passing `--joint_sae` to `train.py` unfreezes the
+invariance layer(s)' SAE and adds it to the optimizer (its own, smaller
+learning rate: `sae_learning_rate`, default 1e-5), so the dictionary itself
+can adapt as the model's activations shift during training — the direct fix
+for the frozen-SAE-drift failure mode the training log's
+`sae_variance_explained` check was built to catch.
+
+This only does anything for C3/C4 (`train.py` prints a message and ignores
+the flag for C1/C2, which don't use the SAE in their loss at all — matched by
+`run_ablation.py`'s own `--joint_sae`, which applies the same rule so its
+expected run_ids stay in sync with what `train.py` actually saves).
+
+**Why it needs an anchor, and what that anchor is.** A jointly-trained SAE
+optimized by the invariance loss alone has a trivial way to "win": collapse
+to an input-independent encoding (perfect invariance, zero information
+content) — nothing in the invariance loss penalizes that. `--joint_sae`
+therefore always adds `sae.reconstruction_loss(...)` (plain reconstruction
+MSE, weighted by `sae_recon_loss_weight`) to the total loss, computed on the
+same per-token activations already fetched for the invariance loss (no extra
+forward passes). This is deliberately reconstruction-only, with no added
+sparsity penalty — the SAE releases used here are TopK/JumpReLU-style, which
+enforce sparsity architecturally rather than via an L1 term, and guessing the
+wrong penalty for the wrong architecture could do more harm than good.
+
+Trained SAE states are saved to `<run_dir>/trained_sae/layer_<l>.pt` and
+picked up automatically by `evaluate.py` when it finds that directory
+alongside the adapter — no separate flag needed at evaluation time.
 
 ## Data discipline
 
-PAWS `labeled_final`'s own train/validation/test splits are used properly this
-time, since actual optimization is involved:
+PAWS `labeled_final`'s own train/validation/test splits are used properly:
 
-- **train**: only same-meaning pairs are used *in* the invariance loss — it
-  only pulls same-meaning pairs together, it never pushes diff-meaning pairs
-  apart. Diff-meaning training-split pairs are loaded but never optimized
-  against.
+- **train**: both same- and diff-meaning pairs are now used *in* the
+  invariance loss (attractive and repulsive respectively — see above).
 - **validation**: periodic checks during training (every `eval_every` steps):
-  LM perplexity, SAE-space same/diff AUROC (the collapse check), and SAE
-  reconstruction variance explained (the frozen-SAE-drift check).
+  LM perplexity, SAE-space same/diff AUROC (the collapse check), mean
+  same/diff SAE-cosine-distance, and SAE reconstruction variance explained
+  (the frozen-SAE-drift check) — all still plain diagnostics, unaffected by
+  the loss formulation changes above.
 - **test**: untouched until `evaluate.py`, which re-runs Step 1's *exact*
   measurement pipeline on it — same metrics, same sampling, same protocol —
   so before/after is a clean comparison on data the model never saw.
 
 WikiText-2 (`Salesforce/wikitext`, `wikitext-2-raw-v1` — the current canonical,
-parquet-backed location; the unprefixed `wikitext` repo has had loading-script
-issues since HF deprecated script-based dataset loading) supplies the LM loss,
-kept deliberately separate from PAWS so the two loss terms aren't both shaped
-by the same narrow sentence pool.
+parquet-backed location) supplies the LM loss, kept deliberately separate
+from PAWS so the two loss terms aren't both shaped by the same narrow
+sentence pool.
 
-## Three implementation decisions worth understanding before reading the code
+## Implementation notes worth understanding before reading the code
 
 **A differentiable surrogate replaces the discrete support-Jaccard metric for
 training.** Step 1's `support_jaccard_distance` thresholds continuous
 activations into a boolean mask — a step function with zero gradient almost
 everywhere, unusable as a training loss. `losses.py`'s `soft_support_distance`
-is a standard continuous relaxation ("soft Dice"), used only for C4's training
-signal. Evaluation (`evaluate.py`) still uses Step 1's exact discrete metric
-unchanged, so the *measured outcome* stays comparable to Step 1, even though
-training uses a different (differentiable) proxy along the way.
+is a standard continuous relaxation ("soft Dice"), used only for C4's
+attractive term. Evaluation (`evaluate.py`) still uses Step 1's exact
+discrete metric unchanged, so the *measured outcome* stays comparable, even
+though training uses a different (differentiable) proxy along the way.
 
-**Plain PyTorch hooks replace TransformerLens.** `peft`'s LoRA is built around
-plain `transformers` module structure; mixing in TransformerLens here would
-fight the tooling. `hooked_activations.py` re-implements the same two hook
-points Step 1 established (`hook_resid_pre` via a forward pre-hook on
-`transformer.h[l]` for GPT-2, `hook_resid_post` via a forward hook on
-`gpt_neox.layers[l]` for Pythia) directly on the HF module tree, and hooks are
-registered on `peft_model.get_base_model()` — the actual underlying model,
-since LoRA replaces target submodules in place within that same module tree.
+**Plain PyTorch hooks replace TransformerLens**, across all three
+architectures now (`hooked_activations.py`): a forward pre-hook on
+`transformer.h[l]` for GPT-2 (`hook_resid_pre`), a forward hook on
+`gpt_neox.layers[l]` for Pythia (`hook_resid_post`), and a forward hook on
+`model.layers[l]` for Gemma3 (matching Gemma Scope 2's residual-stream site —
+also `hook_resid_post`-equivalent). Gemma 3 isn't natively supported by
+TransformerLens's standard `HookedTransformer` at all as of this writing, so
+this approach is also the more future-proof one for adding further models.
+Hooks are registered on `peft_model.get_base_model()` — the actual underlying
+model, since LoRA replaces target submodules in place within that same module
+tree.
 
-**Nothing in the training path is wrapped in `torch.no_grad()`.** The SAE's own
-parameters are frozen via `requires_grad_(False)` (`frozen_sae.py`), not via
-disabling autograd on its `encode()`/`decode()` calls — the latter would break
-gradient flow from the invariance loss back into the LoRA parameters. Autograd
-still computes gradients *with respect to the SAE's input* even though the
-SAE's own weights never accumulate a gradient — the same pattern as using a
+**Nothing in the training path is wrapped in `torch.no_grad()`.** The SAE's
+own parameters are frozen via `requires_grad_(False)` by default
+(`frozen_sae.py`), not via disabling autograd on `encode()`/`decode()` — the
+latter would break gradient flow from the invariance loss back into the LoRA
+parameters (and, with `--joint_sae`, into the SAE's own weights). Autograd
+still computes gradients *with respect to the SAE's input* regardless of
+whether the SAE's own weights require grad — the same pattern as using a
 frozen perceptual-loss network. Only diagnostic/eval code (`evaluate.py`, the
-SAE-drift check in `frozen_sae.py`) explicitly wraps itself in `no_grad()`.
+SAE-drift check, `reconstruction_variance_explained`) explicitly wraps itself
+in `no_grad()`.
 
-## Watch during training: is the frozen SAE still valid?
+**Both `load_lora_model` and `load_model_for_eval` force `torch_dtype=
+torch.float32` explicitly**, rather than letting either default from
+whatever dtype a checkpoint happens to declare. This was found the hard way:
+Pythia-70m-deduped's checkpoint declares float16, which combined with a rare
+WikiText raw-markup artifact (a bare `= Header =` line immediately followed
+by an EOS token) was enough to occasionally push a tiny 6-layer model's
+activations outside float16's representable range and produce
+worse-than-random-guessing loss. See `debug_pythia_loss.py` if a new model
+ever shows a similar symptom (loss above `ln(vocab_size)`).
 
-The SAE was fit to the *original* model's activations. As LoRA adapts the
-model, activations drift, and the frozen SAE's reconstruction of them can
-degrade — tracked directly via `sae_variance_explained` in the training log. A
-small-rank (`lora_r=8`), short (`max_steps=500`) run should keep this small; if
-it drops noticeably, that's a real finding, not noise — it means the
-frozen-SAE assumption needs revisiting (shorter runs, smaller rank, or jointly
-training / periodically refreshing the SAE) before scaling up.
+## Watch during training: is the (frozen or jointly-trained) SAE still valid?
+
+The SAE starts fit to the *original* model's activations. As training
+proceeds, activations drift, and the SAE's reconstruction of them can
+degrade — tracked directly via `sae_variance_explained` in the training log.
+Without `--joint_sae`, a falling value is a real finding: it means the
+frozen-SAE assumption is breaking down for this model/layer/lambda and
+results at that point shouldn't be trusted much either way, since the
+"ruler" being used to measure the effect is itself no longer working well.
+With `--joint_sae`, this same number becomes the direct check on whether the
+reconstruction anchor is actually doing its job — it should stay high;
+if it doesn't, `sae_recon_loss_weight` likely needs to be larger.
 
 ## Running
 
-Needs network access to huggingface.co (models, PAWS, WikiText-2, both SAEs)
-and a GPU for anything beyond the smoke test; written for your own environment.
+Needs network access to huggingface.co (models, PAWS, WikiText-2, all three
+SAEs) and a GPU for anything beyond the smoke test; written for your own
+environment.
 
 ```bash
 pip install -r requirements.txt
 
-python sanity_check.py              # a few optimizer steps, checks gradients actually flow
+python sanity_check.py              # a few optimizer steps per model, frozen AND --joint_sae paths,
+                                       # checks gradients actually flow to the right places in both
+
 python train.py --model gpt2-small --condition C3_sae_magnitude --lam 1.0
+python train.py --model gpt2-small --condition C4_sae_magnitude_support --lam 1.0 --joint_sae
+
 python evaluate.py --model gpt2-small --run_id baseline
 python evaluate.py --model gpt2-small --run_id gpt2-small__C3_sae_magnitude__lam1.0 \
     --adapter_path results/step2_llm/gpt2-small__C3_sae_magnitude__lam1.0/adapter
+# --joint_sae runs: same evaluate.py call, no extra flag -- the trained_sae/
+# checkpoint next to the adapter is picked up automatically.
 
-python run_ablation.py --quick      # one lambda per condition, both models -- do this before...
-python run_ablation.py               # ...the full grid (~27 training runs, expensive)
+python run_ablation.py --quick                  # one lambda per condition, all three models
+python run_ablation.py                            # the full grid (expensive)
+python run_ablation.py --joint_sae --quick          # same, with joint SAE training for C3/C4
 ```
 
 ## Decision gate
@@ -116,7 +219,10 @@ python run_ablation.py               # ...the full grid (~27 training runs, expe
   against it. Worth reporting honestly, and worth redirecting the project's
   framing toward the interpretability angle (which concepts changed) rather
   than a training/robustness claim.
-- **Every condition shows collapse** (`mean_diff_sae_cos` drops about as much
-  as `mean_same_sae_cos` in the training log) → the loss formulation itself
-  needs an explicit repulsive term on diff-meaning pairs before anything else
-  is worth measuring.
+- **Collapse persists even with the repulsive term** (`mean_diff_sae_cos`
+  still drops toward `mean_same_sae_cos` in the training log) → try a larger
+  `repulsive_margin` before concluding the approach doesn't work; the current
+  default (0.5) is a starting point, not a tuned value.
+- **`sae_variance_explained` degrades badly without `--joint_sae`, but stays
+  healthy with it** → the frozen-SAE assumption was the actual bottleneck for
+  that model/layer, and joint training is worth keeping on by default there.

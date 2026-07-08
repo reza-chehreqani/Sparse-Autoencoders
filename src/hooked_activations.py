@@ -57,6 +57,23 @@ def get_transformer_layers(hf_model, model_family: str):
         raise ValueError(f"Unknown model_family: {model_family}")
 
 
+def get_trunk(hf_model, model_family: str):
+    """The transformer trunk only, without the LM head. Used by the batched
+    eval path to avoid computing (and allocating memory for) vocabulary-sized
+    logits that aren't needed just to read intermediate activations off hooks
+    -- for a short PAWS sentence this is a meaningful, easily-avoided amount of
+    memory across a large batch. This matters even more for gemma3-270m, whose
+    vocabulary (256k tokens) is roughly 5x GPT-2's/Pythia's."""
+    if model_family == "gpt2":
+        return hf_model.transformer
+    elif model_family == "gptneox":
+        return hf_model.gpt_neox
+    elif model_family == "gemma3":
+        return hf_model.model
+    else:
+        raise ValueError(f"Unknown model_family: {model_family}")
+
+
 class ResidualStreamRecorder:
     """Registers one hook on one layer and stores whatever it last captured."""
 
@@ -89,14 +106,12 @@ def get_multi_layer_activations(
     device: str,
 ) -> dict[int, list[torch.Tensor]]:
     """
-    One forward pass per sentence, capturing every layer in `layers`
-    simultaneously (hooks on all requested layers are registered before the
-    loop, not re-registered per layer) -- mirrors Step 1's activation_cache.py
-    fix of caching every layer from a single forward pass rather than one pass
-    per layer.
-
-    Returns {layer: [per-sentence [seq_len, d_model] tensors]}, with gradients
-    attached if the caller is not inside a no_grad() context.
+    TRAINING path. One forward pass per sentence, capturing every layer in
+    `layers` simultaneously (hooks for all requested layers are registered
+    before the loop, not re-registered per layer). Returns
+    {layer: [per-sentence [seq_len, d_model] tensors]}, with gradients attached
+    if the caller is not inside a no_grad() context -- deliberately not wrapped
+    in no_grad() here; see module docstring.
     """
     transformer_layers = get_transformer_layers(hf_model, model_family)
     recorders = {layer: ResidualStreamRecorder(transformer_layers[layer], hook_side) for layer in layers}
@@ -108,6 +123,78 @@ def get_multi_layer_activations(
             for layer in layers:
                 results[layer].append(recorders[layer].captured[0])  # drop batch dim -> [seq_len, d_model]
         return results
+    finally:
+        for r in recorders.values():
+            r.remove()
+
+
+@torch.no_grad()
+def get_pooled_activations_for_eval(
+    hf_model,
+    tokenizer,
+    sentences: Sequence[str],
+    layers: Sequence[int],
+    saes: dict,
+    model_family: str,
+    hook_side: str,
+    device: str,
+    batch_size: int,
+) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+    """
+    EVALUATION path. Fixes three things that don't matter at training's small
+    per-step batch sizes but do at evaluation scale (a full PAWS test split):
+
+      1. Every layer is captured from the SAME set of forward passes -- hooks
+         for all of `layers` are registered once, up front -- rather than
+         re-running the model once per layer.
+      2. Sentences are tokenized and run in padded batches of `batch_size`
+         (attention_mask-aware), not one sentence at a time.
+      3. The whole function runs under torch.no_grad(), and only the
+         transformer trunk is called (not the full LM head), so no autograd
+         graph and no unused vocabulary-sized logit tensor is ever built or
+         retained. This is the fix that actually matters most: without it,
+         every one of the (sentence x layer) forward passes retains a full
+         graph back through the model, and those retained graphs accumulating
+         over a full test split is exactly what runs out of memory, even
+         though no single forward pass is large on its own.
+
+    Encoding order still follows the encode-per-token-then-pool rule used
+    everywhere else in this project: the SAE encodes every position, including
+    padding positions (harmless -- they're masked out immediately after), and
+    pooling happens on the resulting per-token codes, not on a pre-averaged raw
+    vector.
+
+    Returns (pooled_raw, pooled_sae), each {layer: [n_sentences, dim]}. Results
+    are moved to CPU immediately after each batch, so accumulated memory lives
+    in system RAM rather than holding GPU memory for the whole dataset at once.
+    """
+    trunk = get_trunk(hf_model, model_family)
+    transformer_layers = get_transformer_layers(hf_model, model_family)
+    recorders = {layer: ResidualStreamRecorder(transformer_layers[layer], hook_side) for layer in layers}
+
+    raw_chunks: dict[int, list[torch.Tensor]] = {layer: [] for layer in layers}
+    sae_chunks: dict[int, list[torch.Tensor]] = {layer: [] for layer in layers}
+    try:
+        for start in range(0, len(sentences), batch_size):
+            batch = list(sentences[start : start + batch_size])
+            encoded = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=128)
+            input_ids = encoded["input_ids"].to(device)
+            attention_mask = encoded["attention_mask"].to(device)
+
+            trunk(input_ids, attention_mask=attention_mask)
+
+            mask = attention_mask.unsqueeze(-1).float()       # [b, seq_len, 1]
+            denom = mask.sum(dim=1).clamp_min(1.0)               # [b, 1]
+            for layer in layers:
+                acts = recorders[layer].captured                  # [b, seq_len, d_model]
+                raw_chunks[layer].append(((acts * mask).sum(dim=1) / denom).cpu())
+
+                codes = saes[layer].encode(acts)                     # [b, seq_len, d_sae]
+                sae_chunks[layer].append(((codes * mask).sum(dim=1) / denom).cpu())
+
+        pooled_raw = {layer: torch.cat(chunks, dim=0) for layer, chunks in raw_chunks.items()}
+        pooled_sae = {layer: torch.cat(chunks, dim=0) for layer, chunks in sae_chunks.items()}
+        return pooled_raw, pooled_sae
     finally:
         for r in recorders.values():
             r.remove()

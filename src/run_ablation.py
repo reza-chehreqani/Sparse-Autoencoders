@@ -19,13 +19,13 @@ import sys
 from config import CONDITION_SPECS, INVARIANCE_LAYERS, LAMBDA_GRID, MODEL_CONFIGS, TRAIN_CONFIG
 
 
-def run_one(model_key: str, condition: str, lam: float) -> str:
-    run_id = f"{model_key}__{condition}__lam{lam}"
+def run_one(model_key: str, condition: str, lam: float, joint_sae: bool) -> str:
+    run_id = f"{model_key}__{condition}__lam{lam}" + ("__jointsae" if joint_sae else "")
     print(f"=== training {run_id} ===")
-    subprocess.run(
-        [sys.executable, "train.py", "--model", model_key, "--condition", condition, "--lam", str(lam)],
-        check=True,
-    )
+    cmd = [sys.executable, "train.py", "--model", model_key, "--condition", condition, "--lam", str(lam)]
+    if joint_sae:
+        cmd.append("--joint_sae")
+    subprocess.run(cmd, check=True)
 
     adapter_path = os.path.join(TRAIN_CONFIG["output_dir"], run_id, "adapter")
     print(f"=== evaluating {run_id} ===")
@@ -67,6 +67,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--quick", action="store_true", help="One lambda per condition (the first in LAMBDA_GRID) instead of the full grid."
     )
+    parser.add_argument(
+        "--joint_sae", action="store_true",
+        help="Also train the SAE for conditions whose invariance loss runs through it (C3/C4). "
+             "Has no effect on C1/C2 -- train.py ignores the flag for those, so it's ignored here too, "
+             "to keep this script's expected run_id in sync with what train.py actually saves.",
+    )
     args = parser.parse_args()
 
     models = [args.model] if args.model else list(MODEL_CONFIGS.keys())
@@ -76,9 +82,12 @@ if __name__ == "__main__":
         ensure_baseline_evaluated(model_key)
         run_ids = []
         for condition, spec in CONDITION_SPECS.items():
+            # Mirrors train.py's own guard: joint_sae only means anything for
+            # conditions whose invariance loss is computed in SAE space.
+            joint_sae_here = args.joint_sae #and spec["use_invariance"] and spec["space"] == "sae"
             if not spec["use_invariance"]:
-                run_ids.append(run_one(model_key, condition, lam=0.0))
+                run_ids.append(run_one(model_key, condition, 0.0, joint_sae_here))
             else:
                 for lam in lambdas:
-                    run_ids.append(run_one(model_key, condition, lam))
+                    run_ids.append(run_one(model_key, condition, lam, joint_sae_here))
         summarize(run_ids, model_key, INVARIANCE_LAYERS[model_key][0])

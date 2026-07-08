@@ -41,11 +41,6 @@ MODEL_CONFIGS = {
         sae=SAEResource(release="gpt2-small-res-jb"),
         sae_id_template="blocks.{layer}.hook_resid_pre",
         hook_side="pre",
-        # NOTE: "c_proj" is the exact submodule name of BOTH the attention output
-        # projection and the MLP output projection in HF's GPT-2 implementation --
-        # peft matches by name suffix, so this also LoRA-wraps the MLP projection,
-        # not attention alone. That's standard practice for LoRA-on-GPT-2, not a
-        # bug, but worth knowing rather than discovering by surprise.
         lora_target_modules=["c_attn", "c_proj"],
     ),
     "pythia-70m-deduped": ModelConfig(
@@ -61,37 +56,13 @@ MODEL_CONFIGS = {
     ),
     "gemma3-270m": ModelConfig(
         name="gemma3-270m",
-        # Best guess following the google/gemma-3-{size}-pt naming convention
-        # used for the other Gemma 3 sizes' base checkpoints; verify with
-        # sanity_check.py -- a wrong repo id fails immediately and clearly
-        # (repository not found), it can't fail silently.
         hf_model_name="google/gemma-3-270m",
         model_family="gemma3",
-        # n_layers/d_model: sources disagree (one third-party writeup says 12
-        # layers / hidden_size 1024; a HF discussion referencing the model's
-        # own config.json suggests hidden_size may be 640). Rather than pick
-        # one and hope, _check_model_shape in hf_model_loading.py asserts both
-        # of these against the actually-loaded model's config and will fail
-        # with the real numbers printed if either guess below is wrong --
-        # update these two values from that error message on first run.
         n_layers=18,
         d_model=640,
-        # Release name as found directly in the SAELens registry by the user
-        # of this project -- could not be independently corroborated via
-        # search (Google's own docs describe the naming as
-        # "gemma-scope-2-270m-pt-resid_post", but SAELens registry aliases
-        # aren't all browsable that way). Trusted as given; if SAE.from_pretrained
-        # rejects it, check the current SAELens pretrained_saes.yaml directly.
         sae=SAEResource(release="gemma-scope-2-270m-pt-res-all"),
-        # sae_id: best guess is the simplest possible form, on the theory that
-        # a "-res-all" release (one config per layer, covering every layer)
-        # doesn't need the width/L0 qualifiers that Gemma Scope 2's general
-        # per-site releases require (e.g. "layer_12_width_16k_l0_medium").
-        # If this fails, that fuller format is the documented fallback --
-        # check the release's file listing on HuggingFace either way.
         sae_id_template="layer_{layer}_width_16k_l0_small",
-        hook_side="post",  # Gemma Scope 2's residual-stream SAEs are trained
-        # post-block, same site convention as Pythia's SAE above.
+        hook_side="post",
         lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     ),
 }
@@ -104,7 +75,7 @@ MODEL_CONFIGS = {
 INVARIANCE_LAYERS = {
     "gpt2-small": [6],           # placeholder
     "pythia-70m-deduped": [3],   # placeholder
-    "gemma3-270m": [9],          # placeholder -- doubly so: also depends on n_layers above being correct
+    "gemma3-270m": [9],          # placeholder -- middle of the now-confirmed 18 layers
 }
 
 # space: "raw" or "sae" -- which representation the magnitude term is computed on.
@@ -122,8 +93,9 @@ PAWS_CONFIG = dict(
     hf_name="google-research-datasets/paws",
     hf_config="labeled_final",
     random_seed=0,
-    n_train_pairs_per_condition=4000,       # same-meaning pairs feed the invariance loss; diff-meaning
-                                              # training-split pairs are loaded but never optimized against
+    n_train_pairs_per_condition=4000,       # both same- and diff-meaning training pairs are now
+                                              # used: same-meaning pairs feed the attractive term,
+                                              # diff-meaning pairs feed the repulsive term (see losses.py)
     n_validation_pairs_per_condition=300,    # periodic collapse / AUROC-gap check during training
     n_test_pairs_per_condition=1000,          # untouched until evaluate.py -- identical to Step 1's test set
 )
@@ -142,10 +114,22 @@ TRAIN_CONFIG = dict(
     lora_alpha=16,
     lora_dropout=0.05,
     learning_rate=1e-4,
+    sae_learning_rate=1e-5,      # only used with --joint_sae; deliberately much smaller than
+                                   # learning_rate, since the SAE dictionary is already converged
+                                   # and this is a gentle continuation, not training from scratch
+    sae_recon_loss_weight=1.0,    # only used with --joint_sae; weight on the SAE's own
+                                    # reconstruction-MSE anchor term (frozen_sae.FrozenSAE.
+                                    # reconstruction_loss) relative to the rest of the total loss --
+                                    # this is what stops the SAE from collapsing to a trivial,
+                                    # input-independent encoding under the invariance loss alone
+    repulsive_margin=0.5,          # target minimum cosine distance for diff-meaning pairs; the
+                                     # repulsive term is zero once a pair is already this far apart
+                                     # (see losses.py's module docstring for why a hinge, not an
+                                     # unbounded "maximize distance" term)
     batch_size_lm=8,
-    batch_size_invariance=8,   # number of PAWS pairs per step; processed as one forward
-                                # pass per sentence (see hooked_activations.py), not
-                                # padded into a single batched call
+    batch_size_invariance=8,   # number of PAWS pairs per step, PER condition (same and diff each
+                                # get this many); processed as one forward pass per sentence (see
+                                # hooked_activations.py), not padded into a single batched call
     max_steps=500,               # deliberately short -- see README on SAE-drift risk
     eval_every=50,
     support_threshold=0.0,
