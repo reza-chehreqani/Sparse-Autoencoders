@@ -102,10 +102,10 @@ def invariance_loss(
     else:
         raise ValueError(f"Unknown space: {space}")
 
-    attractive = cosine_similarity(same_a, same_b).mean() #+ normalized_l2(same_a, same_b).mean()
-    repulsive = cosine_similarity(diff_a, diff_b).mean()
-    total = repulsive - attractive
-    components = dict(attractive=attractive.item(), repulsive=repulsive.item())
+    attractive = cosine_similarity(same_a, same_b)#.mean() #+ normalized_l2(same_a, same_b).mean()
+    repulsive = cosine_similarity(diff_a, diff_b)#.mean()
+    total = (repulsive[:, None] - attractive[None, :]).mean()
+    components = dict(attractive=attractive.mean().item(), repulsive=repulsive.mean().item())
 
     if space == "sae" and use_support_term:
         support = soft_support_distance(same_a, same_b).mean()
