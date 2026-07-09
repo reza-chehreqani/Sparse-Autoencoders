@@ -39,7 +39,7 @@ so the repulsive term stays magnitude-only.
 
 import torch
 
-from metrics import cosine_distance, normalized_l2
+from metrics import cosine_similarity, normalized_l2
 
 
 def lm_loss(model, input_ids: torch.Tensor) -> torch.Tensor:
@@ -102,9 +102,9 @@ def invariance_loss(
     else:
         raise ValueError(f"Unknown space: {space}")
 
-    attractive = cosine_distance(same_a, same_b).mean() + normalized_l2(same_a, same_b).mean()
-    repulsive = torch.relu(repulsive_margin - cosine_distance(diff_a, diff_b)).mean()
-    total = attractive + repulsive
+    attractive = cosine_similarity(same_a, same_b).mean() #+ normalized_l2(same_a, same_b).mean()
+    repulsive = cosine_similarity(diff_a, diff_b).mean()
+    total = repulsive - attractive
     components = dict(attractive=attractive.item(), repulsive=repulsive.item())
 
     if space == "sae" and use_support_term:

@@ -90,16 +90,42 @@ the flag for C1/C2, which don't use the SAE in their loss at all — matched by
 expected run_ids stay in sync with what `train.py` actually saves).
 
 **Why it needs an anchor, and what that anchor is.** A jointly-trained SAE
-optimized by the invariance loss alone has a trivial way to "win": collapse
-to an input-independent encoding (perfect invariance, zero information
-content) — nothing in the invariance loss penalizes that. `--joint_sae`
-therefore always adds `sae.reconstruction_loss(...)` (plain reconstruction
-MSE, weighted by `sae_recon_loss_weight`) to the total loss, computed on the
-same per-token activations already fetched for the invariance loss (no extra
-forward passes). This is deliberately reconstruction-only, with no added
-sparsity penalty — the SAE releases used here are TopK/JumpReLU-style, which
-enforce sparsity architecturally rather than via an L1 term, and guessing the
-wrong penalty for the wrong architecture could do more harm than good.
+optimized by the invariance loss alone has two trivial ways to "win" that
+have nothing to do with the actual objective:
+1. Collapse to an input-independent encoding (perfect invariance, zero
+   information content) — nothing in the invariance loss penalizes that.
+2. Get denser and denser, since more active latents generally make
+   reconstruction (and therefore matching two activations) easier, at the
+   cost of defeating the point of using a *sparse* autoencoder at all.
+
+`--joint_sae` therefore always adds two anchor terms from
+`FrozenSAE.training_losses(...)`, computed together from a single `encode()`
+call on the same per-token activations already fetched for the invariance
+loss (no extra forward passes):
+- **reconstruction** (MSE, weight `sae_recon_loss_weight`, default 1.0):
+  guards against collapse (1) above.
+- **sparsity** (L1 on the non-negative code, weight `sparsity_loss_weight`,
+  default 1e-4): guards against densification (2) above.
+
+The sparsity weight needs to be small and is only an approximate starting
+point — raw L1 magnitude scales with dictionary width (thousands of
+dimensions) and is typically far larger than the reconstruction MSE, so an
+unweighted or over-weighted term will crush the SAE toward near-zero activity
+rather than gently discourage densification. Watch `sae_mean_l0` (average
+active latents per token, logged every validation step) after changing this
+weight or moving to a wider SAE than the ones used here — it should drift
+gradually, not collapse toward 0 or jump to "most of the dictionary counts as
+active."
+
+The L1 form itself is a deliberately generic, architecture-agnostic choice.
+It's the traditional sparsity loss for "standard"/"gated" SAEs, but the
+releases used here are TopK/JumpReLU-style, which enforce sparsity
+architecturally (hard top-k selection, or a learned per-feature threshold)
+rather than via L1 — so this term acts as an additional soft regularizer for
+those rather than a reproduction of their native training objective. If you
+know a given release's exact architecture (`sae.cfg.architecture` reports it)
+and want to match it exactly, `FrozenSAE.training_losses` is the place to
+specialize it.
 
 Trained SAE states are saved to `<run_dir>/trained_sae/layer_<l>.pt` and
 picked up automatically by `evaluate.py` when it finds that directory
@@ -226,3 +252,7 @@ python run_ablation.py --joint_sae --quick          # same, with joint SAE train
 - **`sae_variance_explained` degrades badly without `--joint_sae`, but stays
   healthy with it** → the frozen-SAE assumption was the actual bottleneck for
   that model/layer, and joint training is worth keeping on by default there.
+- **`sae_mean_l0` collapses toward 0 or balloons toward the full dictionary
+  width with `--joint_sae`** → `sparsity_loss_weight` is off (too high or too
+  low respectively) for this SAE's actual scale; retune before trusting that
+  run's other numbers.

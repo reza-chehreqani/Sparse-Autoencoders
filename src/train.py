@@ -6,12 +6,14 @@ AND one PAWS diff-meaning batch, combining all of it into a single backward pass
 
     total_loss = lm_loss(wikitext_batch)
                + lambda * [ attractive(same_batch) + repulsive(diff_batch) (+ support) ]
-               + (only with --joint_sae) sae_recon_loss_weight * reconstruction_loss(...)
+               + (only with --joint_sae) sae_recon_loss_weight * reconstruction
+               + (only with --joint_sae) sparsity_loss_weight * sparsity
 
 See losses.py for why the repulsive term uses a margin/hinge rather than an
-unbounded "maximize distance" objective, and frozen_sae.py for why joint SAE
-training needs the reconstruction-loss anchor to avoid a trivial collapsed
-solution.
+unbounded "maximize distance" objective, and frozen_sae.py's training_losses
+for why joint SAE training needs both a reconstruction anchor (to avoid a
+trivial collapsed solution) and a sparsity term (to avoid just getting denser
+as an easy way to reduce reconstruction error).
 
 Produces, under results/step2_llm/<model>__<condition>__lam<lambda>[__jointsae]/:
   - adapter/               the trained LoRA adapter (not the full model)
@@ -22,8 +24,11 @@ Produces, under results/step2_llm/<model>__<condition>__lam<lambda>[__jointsae]/
                             same/diff AUROC (the collapse check -- this should
                             WIDEN over training, not shrink), mean same/diff
                             SAE-cosine-distance, SAE reconstruction variance
-                            explained (the frozen-SAE-drift check), and the
-                            attractive/repulsive/support loss components.
+                            explained (the frozen-SAE-drift check), average
+                            active latents per token (sae_mean_l0 -- the
+                            sparsity check, most relevant with --joint_sae),
+                            and the attractive/repulsive/support/reconstruction/
+                            sparsity loss components.
 
 Usage:
     python train.py --model gpt2-small --condition C3_sae_magnitude --lam 1.0
@@ -125,6 +130,7 @@ def run_validation_checks(
 
     all_same_tokens = torch.cat(acts["a_same"] + acts["b_same"], dim=0)
     var_explained = sae.reconstruction_variance_explained(all_same_tokens)
+    mean_l0 = sae.mean_l0(all_same_tokens)
 
     peft_model.train()
     return dict(
@@ -133,6 +139,7 @@ def run_validation_checks(
         mean_same_sae_cos=float(same_cos.mean()),
         mean_diff_sae_cos=float(diff_cos.mean()),
         sae_variance_explained=float(var_explained),
+        sae_mean_l0=float(mean_l0),
     )
 
 
@@ -227,11 +234,19 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, seed: int =
 
             if joint_sae:
                 recon_loss = torch.tensor(0.0, device=device)
+                sparsity_loss = torch.tensor(0.0, device=device)
                 for l in inv_layers:
                     all_acts = torch.cat(same_acts_a[l] + same_acts_b[l] + diff_acts_a[l] + diff_acts_b[l], dim=0)
-                    recon_loss = recon_loss + saes[l].reconstruction_loss(all_acts)
-                total_loss = total_loss + TRAIN_CONFIG["sae_recon_loss_weight"] * recon_loss
+                    sae_losses = saes[l].training_losses(all_acts)
+                    recon_loss = recon_loss + sae_losses["reconstruction"]
+                    sparsity_loss = sparsity_loss + sae_losses["sparsity"]
+                total_loss = (
+                    total_loss
+                    + TRAIN_CONFIG["sae_recon_loss_weight"] * recon_loss
+                    + TRAIN_CONFIG["sparsity_loss_weight"] * sparsity_loss
+                )
                 inv_components["sae_recon_loss"] = recon_loss.item()
+                inv_components["sae_sparsity_loss"] = sparsity_loss.item()
         else:
             loss_inv = torch.tensor(0.0)
             inv_components = {}
@@ -252,7 +267,7 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, seed: int =
                 f"  step {step}: lm_loss={checks['loss_lm']:.3f} inv_loss={checks['loss_inv']:.4f} "
                 f"ppl={checks['perplexity']:.2f} auroc_sae={checks['auroc_sae']:.3f} "
                 f"same_cos={checks['mean_same_sae_cos']:.3f} diff_cos={checks['mean_diff_sae_cos']:.3f} "
-                f"sae_var_explained={checks['sae_variance_explained']:.3f}"
+                f"sae_var_explained={checks['sae_variance_explained']:.3f} sae_mean_l0={checks['sae_mean_l0']:.1f}"
             )
 
     run_id = f"{model_key}__{condition}__lam{lam}" + ("__jointsae" if joint_sae else "")

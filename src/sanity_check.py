@@ -80,7 +80,12 @@ def run_steps(model_key, model_cfg, joint_sae: bool):
         loss = lm_loss(peft_model, lm_batch) + 1.0 * inv_total
         if joint_sae:
             all_acts = torch.cat(same_a[layer] + same_b[layer] + diff_a[layer] + diff_b[layer], dim=0)
-            loss = loss + saes[layer].reconstruction_loss(all_acts)
+            sae_losses = saes[layer].training_losses(all_acts)
+            loss = (
+                loss
+                + TRAIN_CONFIG["sae_recon_loss_weight"] * sae_losses["reconstruction"]
+                + TRAIN_CONFIG["sparsity_loss_weight"] * sae_losses["sparsity"]
+            )
 
         optimizer.zero_grad()
         loss.backward()

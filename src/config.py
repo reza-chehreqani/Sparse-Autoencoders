@@ -41,6 +41,11 @@ MODEL_CONFIGS = {
         sae=SAEResource(release="gpt2-small-res-jb"),
         sae_id_template="blocks.{layer}.hook_resid_pre",
         hook_side="pre",
+        # NOTE: "c_proj" is the exact submodule name of BOTH the attention output
+        # projection and the MLP output projection in HF's GPT-2 implementation --
+        # peft matches by name suffix, so this also LoRA-wraps the MLP projection,
+        # not attention alone. That's standard practice for LoRA-on-GPT-2, not a
+        # bug, but worth knowing rather than discovering by surprise.
         lora_target_modules=["c_attn", "c_proj"],
     ),
     "pythia-70m-deduped": ModelConfig(
@@ -56,13 +61,29 @@ MODEL_CONFIGS = {
     ),
     "gemma3-270m": ModelConfig(
         name="gemma3-270m",
+        # Confirmed by you: "google/gemma-3-270m-pt" 404s, "google/gemma-3-270m"
+        # (no "-pt" suffix) loads correctly.
         hf_model_name="google/gemma-3-270m",
         model_family="gemma3",
+        # n_layers confirmed by the shape-check assertion's own error message:
+        # "Expected 12 layers for gemma3-270m, got 18". d_model is still an
+        # open guess -- the assertion only reports the FIRST mismatch it hits
+        # (n_layers was checked first and failed, so the d_model check never
+        # ran). Next run either passes or reports the real d_model the same
+        # way; update the value below from that message if so.
         n_layers=18,
         d_model=640,
+        # Release name as found directly in the SAELens registry by the user
+        # of this project -- confirmed working (the earlier ValueError listed
+        # its valid sae_ids, proving the release name itself resolves).
         sae=SAEResource(release="gemma-scope-2-270m-pt-res-all"),
+        # sae_id confirmed from the ValueError's own "Valid IDs are [...]"
+        # list: format is "layer_{N}_width_{16k|262k}_l0_{small|big}", not the
+        # bare "layer_{N}" originally guessed. Using the smaller width/sparser
+        # L0 option for rough comparability with the other two models' SAEs.
         sae_id_template="layer_{layer}_width_16k_l0_small",
-        hook_side="post",
+        hook_side="post",  # Gemma Scope 2's residual-stream SAEs are trained
+        # post-block, same site convention as Pythia's SAE above.
         lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     ),
 }
@@ -122,6 +143,16 @@ TRAIN_CONFIG = dict(
                                     # reconstruction_loss) relative to the rest of the total loss --
                                     # this is what stops the SAE from collapsing to a trivial,
                                     # input-independent encoding under the invariance loss alone
+    sparsity_loss_weight=1e-4,     # only used with --joint_sae; weight on the SAE's L1 sparsity
+                                     # term (frozen_sae.FrozenSAE.training_losses). Deliberately
+                                     # small and approximate -- raw L1 magnitude scales with
+                                     # dictionary width (thousands of dimensions) and is typically
+                                     # much larger than the reconstruction MSE, so an unweighted or
+                                     # over-weighted term will crush the SAE toward near-zero
+                                     # activity rather than gently discourage densification. Watch
+                                     # mean_l0 in the training log after changing this -- it should
+                                     # move gradually, not collapse toward 0 or jump to "most of the
+                                     # dictionary is active."
     repulsive_margin=0.5,          # target minimum cosine distance for diff-meaning pairs; the
                                      # repulsive term is zero once a pair is already this far apart
                                      # (see losses.py's module docstring for why a hinge, not an

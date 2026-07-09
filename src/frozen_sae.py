@@ -13,13 +13,16 @@ inside a perceptual loss) -- it simply never accumulates a gradient *into*
 that module's own (non-trainable) parameters.
 
 Can be made trainable via make_trainable(), for train.py's --joint_sae flag.
-When doing this, always pair it with reconstruction_loss() as an anchor term
-in the total loss. Without that anchor, a jointly-trained SAE has a trivial
-way to "solve" the invariance loss: collapse to an input-independent encoding
+When doing this, always pair it with training_losses() as an anchor in the
+total loss. Without that anchor, a jointly-trained SAE has a trivial way to
+"solve" the invariance loss: collapse to an input-independent encoding
 (perfect invariance, zero information content), since nothing else in the
-invariance loss cares whether the SAE still reconstructs anything. The
-reconstruction term is what keeps that degenerate solution more costly than
-actually satisfying the invariance objective honestly.
+invariance loss cares whether the SAE still reconstructs anything or stays
+sparse. The reconstruction term is what keeps that degenerate solution more
+costly than actually satisfying the invariance objective honestly; the
+sparsity term is what keeps the SAE from just getting denser and denser as an
+easy way to reduce reconstruction error, defeating the point of using an SAE
+at all.
 """
 
 import warnings
@@ -44,7 +47,7 @@ class FrozenSAE:
 
     def make_trainable(self) -> None:
         """Unfreezes this SAE's parameters for joint training. See module
-        docstring -- always pair with reconstruction_loss() when doing this."""
+        docstring -- always pair with training_losses() when doing this."""
         for p in self._sae.parameters():
             p.requires_grad_(True)
         self._sae.train()
@@ -61,22 +64,51 @@ class FrozenSAE:
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         return self._sae.decode(codes)
 
-    def reconstruction_loss(self, acts: torch.Tensor) -> torch.Tensor:
-        """Standard SAE training objective: reconstruction MSE between the
-        input activations and the SAE's decode(encode(input)). Deliberately no
-        explicit sparsity penalty on top -- SAE architectures differ in how
-        they enforce sparsity, and the releases used in this project are
-        TopK/JumpReLU-style, which enforce it architecturally rather than via
-        an L1 term; adding one tuned for the wrong architecture could do more
-        harm than good. If you know your SAE's architecture and want a
-        sparsity term too, this is the place to add it.
+    def training_losses(self, acts: torch.Tensor) -> dict:
+        """The SAE's own standard training objective, for --joint_sae's anchor
+        term: reconstruction MSE plus an L1 sparsity penalty on the code. Both
+        come from a single encode() call rather than two, to avoid doubling
+        the forward-pass cost.
+
+        The L1 term is deliberately a generic, architecture-agnostic choice:
+        codes are non-negative (ReLU-based encoders), so their L1 norm is just
+        their sum. This is the traditional sparsity loss for "standard"/
+        "gated" SAEs and is always well-defined regardless of architecture,
+        but it is NOT necessarily identical to how every SAE release used in
+        this project was originally trained -- TopK/JumpReLU SAEs (several of
+        the releases here) enforce sparsity architecturally (a hard top-k
+        selection, or a learned per-feature threshold) rather than via L1, so
+        this term acts as an additional soft regularizer for those rather than
+        a reproduction of their native training loss. If you know a given
+        release's exact architecture (`sae.cfg.architecture` reports it) and
+        want to match its native objective exactly -- e.g. an L0-style penalty
+        for JumpReLU -- this is the place to specialize it.
+
+        Raw L1 magnitude scales with dictionary width and is typically much
+        larger than the reconstruction MSE, so it needs a small weight
+        (TRAIN_CONFIG's sparsity_loss_weight) to avoid dominating the total
+        loss and crushing the SAE's activity toward zero -- watch mean_l0()
+        below alongside reconstruction_variance_explained() to check the
+        weight is in a sane range, not just the loss value going down.
         """
         if self._should_center:
             acts = acts - acts.mean(dim=-1, keepdim=True)
             
         codes = self.encode(acts)
         recon = self.decode(codes)
-        return torch.nn.functional.mse_loss(recon, acts)
+        reconstruction = torch.nn.functional.mse_loss(recon, acts)
+        sparsity = codes.sum(dim=-1).mean()
+        return dict(reconstruction=reconstruction, sparsity=sparsity)
+
+    @torch.no_grad()
+    def mean_l0(self, acts: torch.Tensor) -> float:
+        """Average number of active (nonzero) latents per token -- a direct,
+        interpretable sparsity readout. Useful for checking the sparsity term
+        in --joint_sae training is having a sane effect: shouldn't collapse
+        toward ~0 active features (too aggressive a weight) or drift toward
+        counting most of the dictionary as active (too weak, or absent)."""
+        codes = self.encode(acts)
+        return (codes > 0).float().sum(dim=-1).mean().item()
 
     @torch.no_grad()
     def reconstruction_variance_explained(self, acts: torch.Tensor) -> float:
