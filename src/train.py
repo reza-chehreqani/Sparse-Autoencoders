@@ -5,7 +5,7 @@ Each step draws one WikiText batch and (for C2-C4) one PAWS same-meaning batch
 AND one PAWS diff-meaning batch, combining all of it into a single backward pass:
 
     total_loss = lm_loss(wikitext_batch)
-               + lambda * [ attractive(same_batch) + repulsive(diff_batch) (+ support) ]
+               + lambda * [ invariance_loss(same_batch, diff_batch) (+ support) ]
                + (only with --joint_sae) sae_recon_loss_weight * reconstruction
                + (only with --joint_sae) sparsity_loss_weight * sparsity
 
@@ -47,7 +47,7 @@ from frozen_sae import load_layer_saes
 from hf_model_loading import load_lora_model, load_tokenizer, resolve_device
 from hooked_activations import get_multi_layer_activations
 from lm_dataset import WikiTextBatcher, load_wikitext_train_text
-from losses import invariance_loss, lm_loss, pool_sae_codes
+from losses import invariance_loss, lm_loss, pool_sae_codes, ScaledCosineBCELoss
 from metrics import cosine_distance, discrimination_auroc
 from pairs_dataset import load_paws_split
 
@@ -186,7 +186,15 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, seed: int =
         wikitext_texts[-200:], tokenizer, WIKITEXT_CONFIG["max_seq_len"], device, seed=seed + 1
     )
 
-    param_groups = [dict(params=[p for p in peft_model.parameters() if p.requires_grad], lr=TRAIN_CONFIG["learning_rate"])]
+    # Initialize the BCE Criterion
+    bce_criterion = ScaledCosineBCELoss().to(device)
+
+    # Append BCE Criterion parameters to the main optimizer group
+    param_groups = [dict(
+        params=[p for p in peft_model.parameters() if p.requires_grad] + list(bce_criterion.parameters()), 
+        lr=TRAIN_CONFIG["learning_rate"]
+    )]
+    
     if joint_sae:
         sae_params = [p for l in inv_layers for p in saes[l].parameters()]
         param_groups.append(dict(params=sae_params, lr=TRAIN_CONFIG["sae_learning_rate"]))
@@ -224,7 +232,7 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, seed: int =
             for l in inv_layers:
                 l_total, l_components = invariance_loss(
                     saes[l], same_acts_a[l], same_acts_b[l], diff_acts_a[l], diff_acts_b[l],
-                    spec["space"], spec["use_support_term"], TRAIN_CONFIG["repulsive_margin"],
+                    spec["space"], spec["use_support_term"], bce_criterion,
                 )
                 loss_inv = loss_inv + l_total
                 for k, v in l_components.items():

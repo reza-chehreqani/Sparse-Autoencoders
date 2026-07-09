@@ -14,10 +14,6 @@ import torch
 from scipy.stats import mannwhitneyu
 from sklearn.metrics import roc_auc_score
 
-def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    a = a / a.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    b = b / b.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    return (a * b).sum(dim=-1) 
 
 def cosine_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     a = a / a.norm(dim=-1, keepdim=True).clamp_min(1e-8)

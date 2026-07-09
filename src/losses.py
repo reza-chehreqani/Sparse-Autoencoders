@@ -4,42 +4,50 @@ Loss terms for Step 2 training.
 lm_loss: standard causal LM cross-entropy, delegated to the model's own `.loss`
 when `labels` are passed -- HF handles the label-shifting internally.
 
-invariance_loss: now has two components, not one.
-  - attractive: pools each same-meaning sentence pair's per-token activations
-    through the layer's SAE (magnitude term) and pulls them together -- this is
-    the original term.
-  - repulsive: does the same pooling for DIFF-meaning pairs, and pushes them
-    apart via a margin/hinge loss, active only while they're closer than
-    `repulsive_margin`.
-
-Why a margin/hinge rather than "maximize distance": an unbounded repulsive
-term has no natural stopping point -- it would keep pushing diff-meaning pairs
-further apart forever, fighting the LM objective for no additional benefit
-once they're already well separated, and is a common source of training
-instability in contrastive-style setups. A hinge loss (zero once pairs are
-`repulsive_margin` apart) gives exactly the pressure needed to prevent
-collapse -- both same- and diff-meaning distances shrinking together, which
-the training log's collapse check is designed to catch -- without an
-unbounded, ever-present pull in the opposite direction.
-
-Why the discrete support-Jaccard metric needs a relaxation for training: Step
-1's support_jaccard_distance (metrics.py) thresholds continuous activations
-into a boolean mask and computes exact set intersection/union -- a step
-function with zero gradient almost everywhere, so it cannot be used as a
-training signal directly. It remains the right tool for *evaluation*
-(evaluate.py reuses it unchanged from Step 1), but training needs a continuous
-surrogate. `soft_support_distance` below is a standard relaxation used
-elsewhere as "soft Dice" (e.g. in image-segmentation losses): it replaces
-boolean intersection/union with elementwise minimums and sums of the
-continuous, non-negative SAE activations. This is applied only to the
-attractive (same-meaning) side -- pushing *supports* apart for diff-meaning
-pairs doesn't have as clean an interpretation as pulling them together does,
-so the repulsive term stays magnitude-only.
+invariance_loss: now utilizes a Scaled Cosine Binary Cross-Entropy (BCE) approach.
+  - Computes cosine similarity for both same-meaning and diff-meaning pairs.
+  - Applies a learnable scale and bias to these similarities to generate logits.
+  - Uses BCE to push same-meaning pairs toward 1 and diff-meaning pairs toward 0.
+  - This removes the need for a rigid hyperparameter margin, as the model learns 
+    the optimal boundary dynamically during training.
 """
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from metrics import cosine_similarity, normalized_l2
+from metrics import cosine_distance, normalized_l2
+
+
+class ScaledCosineBCELoss(nn.Module):
+    def __init__(self, initial_scale=10.0, initial_bias=0.0):
+        super().__init__()
+        # Learnable parameters for dynamic margin scaling
+        self.scale = nn.Parameter(torch.tensor([initial_scale]))
+        self.bias = nn.Parameter(torch.tensor([initial_bias]))
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, same_a, same_b, diff_a, diff_b):
+        # Calculate cosine similarities
+        sim_same = F.cosine_similarity(same_a, same_b)
+        sim_diff = F.cosine_similarity(diff_a, diff_b)
+        
+        # Concatenate similarities into a single batch
+        sims = torch.cat([sim_same, sim_diff], dim=0)
+        
+        # Create labels: 1.0 for same-meaning, 0.0 for diff-meaning
+        labels = torch.cat([
+            torch.ones_like(sim_same),
+            torch.zeros_like(sim_diff)
+        ], dim=0)
+        
+        # Scale and shift to create logits
+        logits = sims * self.scale + self.bias
+        
+        # Calculate BCE
+        loss = self.bce(logits, labels)
+        
+        return loss, sim_same.mean(), sim_diff.mean()
 
 
 def lm_loss(model, input_ids: torch.Tensor) -> torch.Tensor:
@@ -82,7 +90,7 @@ def invariance_loss(
     diff_b_acts: list[torch.Tensor],
     space: str,  # "raw" or "sae"
     use_support_term: bool,
-    repulsive_margin: float,
+    bce_criterion: ScaledCosineBCELoss,
 ) -> tuple[torch.Tensor, dict]:
     """
     Returns (total_loss, components) where components is a plain-float dict
@@ -102,10 +110,15 @@ def invariance_loss(
     else:
         raise ValueError(f"Unknown space: {space}")
 
-    attractive = cosine_similarity(same_a, same_b)#.mean() #+ normalized_l2(same_a, same_b).mean()
-    repulsive = cosine_similarity(diff_a, diff_b)#.mean()
-    total = (repulsive[:, None] - attractive[None, :]).mean()
-    components = dict(attractive=attractive.mean().item(), repulsive=repulsive.mean().item())
+    # Compute Scaled Cosine BCE
+    total, attractive, repulsive = bce_criterion(same_a, same_b, diff_a, diff_b)
+    
+    components = dict(
+        attractive=attractive.item(), 
+        repulsive=repulsive.item(),
+        bce_loss=total.item()
+    )
+
 
     if space == "sae" and use_support_term:
         support = soft_support_distance(same_a, same_b).mean()
