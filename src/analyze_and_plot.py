@@ -81,9 +81,14 @@ def parse_run_id(run_id: str):
     if run_id == "baseline":
         return None, None, None
     parts = run_id.split("__")
-    if len(parts) != 3 or not parts[2].startswith("lam"):
+    if (len(parts) != 3 and len(parts) != 4) or not parts[2].startswith("lam"):
         return None, None, None
-    model_key, condition, lam_part = parts
+    if len(parts) == 3:
+        model_key, condition, lam_part = parts
+    elif len(parts) == 4:
+        model_key, condition, lam_part, _ = parts
+    else:
+        return None, None, None
     try:
         lam = float(lam_part[len("lam") :])
     except ValueError:
