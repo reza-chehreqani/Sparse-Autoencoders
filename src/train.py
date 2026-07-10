@@ -368,7 +368,7 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
                 peft_model, hf_model, tokenizer, saes, inv_layers, model_cfg.model_family, model_cfg.hook_side,
                 val_same, val_diff, wikitext_val_batcher, device,
             )
-            checks.update(step=step, loss_lm=float(loss_lm.item()), loss_inv=float(loss_inv.item()), **inv_components)
+            checks.update(step=step, loss_lm=float(loss_lm.item()), loss_lm_sae=float(loss_lm_sae.item()), loss_inv=float(loss_inv.item()), loss_inv_sae=float(loss_inv_sae.item()), total_loss=float(total_loss.item()), **inv_components)
             log.append(checks)
             print(
                 f"  step {step}: lm_loss={checks['loss_lm']:.3f} inv_loss={checks['loss_inv']:.4f} "
