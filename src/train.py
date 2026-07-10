@@ -345,7 +345,7 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
                 f"sae_var_explained={checks['sae_variance_explained']:.3f} sae_mean_l0={checks['sae_mean_l0']:.1f}"
             )
 
-    run_id = f"{model_key}__{condition}__lam{lam}" + ("__jointsae" if joint_sae else "__saereg" if sae_reg else "")
+    run_id = f"{model_key}__{condition}__lam{lam}" #+ ("__jointsae" if joint_sae else "__saereg" if sae_reg else "")
     out_dir = os.path.join(TRAIN_CONFIG["output_dir"], run_id)
     os.makedirs(out_dir, exist_ok=True)
     peft_model.save_pretrained(os.path.join(out_dir, "adapter"))
