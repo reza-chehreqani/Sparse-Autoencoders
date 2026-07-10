@@ -73,63 +73,96 @@ that directory before re-running — new runs reuse the same run_id naming and
 would land in the same folders, mixing two different loss formulations
 together under what looks like one consistent set of results.
 
-## Optional: jointly train the SAE (`--joint_sae`)
+## Keeping the SAE valid as the model trains
 
-By default the SAE stays frozen throughout training (gradients flow *through*
-it into the LoRA parameters, but never *into* its own weights — see
-`frozen_sae.py`). Passing `--joint_sae` to `train.py` unfreezes the
-invariance layer(s)' SAE and adds it to the optimizer (its own, smaller
-learning rate: `sae_learning_rate`, default 1e-5), so the dictionary itself
-can adapt as the model's activations shift during training — the direct fix
-for the frozen-SAE-drift failure mode the training log's
-`sae_variance_explained` check was built to catch.
+Fine-tuning the model shifts its activations, and a frozen SAE's
+reconstruction of them can degrade as a result — tracked directly via
+`sae_variance_explained` in the training log. There are three ways to handle
+this, mutually exclusive (`train.py` and `run_ablation.py` both assert
+against combining them):
 
-This only does anything for C3/C4 (`train.py` prints a message and ignores
-the flag for C1/C2, which don't use the SAE in their loss at all — matched by
-`run_ablation.py`'s own `--joint_sae`, which applies the same rule so its
-expected run_ids stay in sync with what `train.py` actually saves).
+| Mode | Flag | What moves | SAE at evaluation time |
+|---|---|---|---|
+| Frozen (default) | — | only the model | same SAE, but its reconstruction of the model's activations may have degraded |
+| Joint SAE training | `--joint_sae` | model *and* SAE | a different SAE than the baseline was evaluated with |
+| Frozen-SAE regularizer | `--sae_reg` | only the model (nudged toward the SAE) | identical, unchanged SAE |
 
-**Why it needs an anchor, and what that anchor is.** A jointly-trained SAE
-optimized by the invariance loss alone has two trivial ways to "win" that
-have nothing to do with the actual objective:
-1. Collapse to an input-independent encoding (perfect invariance, zero
-   information content) — nothing in the invariance loss penalizes that.
-2. Get denser and denser, since more active latents generally make
-   reconstruction (and therefore matching two activations) easier, at the
-   cost of defeating the point of using a *sparse* autoencoder at all.
+**Recommendation: use `--sae_reg` if the goal is specifically to keep the SAE
+valid for evaluation** (as opposed to exploring what happens when the whole
+representation — model and dictionary together — is allowed to co-adapt,
+which is a different, also-interesting question `--joint_sae` answers
+instead). The reasoning:
 
-`--joint_sae` therefore always adds two anchor terms from
+- `--joint_sae` keeps *reconstruction quality* high, but does it by letting
+  the SAE's own dictionary drift, so the baseline and the trained checkpoint
+  end up evaluated with two different SAEs (see `trained_sae/` below) — even
+  at `sae_variance_explained` ≈ 0.99, individual latent directions may have
+  moved, so "layer 6, latent 4021" isn't guaranteed to mean the same thing
+  before and after. It also introduces a real confound: gradients from the
+  invariance loss flow into the SAE's own weights too, so some of any
+  measured invariance gain could come from the SAE's projection adapting
+  rather than the model's actual representations changing.
+- `--sae_reg` never touches the SAE at all. Its reconstruction loss on the
+  model's current activations is added to the total loss as a regularizer —
+  gradient flows through the frozen SAE into the LoRA parameters, penalizing
+  the model for drifting away from the region the SAE can reconstruct, the
+  same way a KL-to-reference-policy penalty works in RL fine-tuning (a frozen
+  reference model computes a penalty term; the *policy*, not the reference,
+  gets updated). The SAE used for evaluation is then guaranteed identical to
+  the one used at the start of training — no ambiguity about whether the
+  yardstick moved. Evaluation needs no special handling either: `evaluate.py`
+  just uses the same fresh pretrained SAE it always would, since nothing
+  about it ever changed.
+
+### `--joint_sae` details
+
+Unfreezes the invariance layer(s)' SAE and adds it to the optimizer (own,
+smaller learning rate: `sae_learning_rate`, default 1e-5). A jointly-trained
+SAE optimized by the invariance loss alone has two trivial ways to "win" that
+have nothing to do with the actual objective — collapsing to an
+input-independent encoding (perfect invariance, zero information content),
+or just getting denser (more active latents generally make matching two
+activations easier, at the cost of defeating the point of a *sparse*
+autoencoder). `--joint_sae` therefore always adds two anchor terms from
 `FrozenSAE.training_losses(...)`, computed together from a single `encode()`
 call on the same per-token activations already fetched for the invariance
 loss (no extra forward passes):
-- **reconstruction** (MSE, weight `sae_recon_loss_weight`, default 1.0):
-  guards against collapse (1) above.
+- **reconstruction** (MSE, weight `sae_recon_loss_weight`, default 1.0) —
+  guards against collapse.
 - **sparsity** (L1 on the non-negative code, weight `sparsity_loss_weight`,
-  default 1e-4): guards against densification (2) above.
+  default 1e-4) — guards against densification.
 
-The sparsity weight needs to be small and is only an approximate starting
-point — raw L1 magnitude scales with dictionary width (thousands of
-dimensions) and is typically far larger than the reconstruction MSE, so an
-unweighted or over-weighted term will crush the SAE toward near-zero activity
-rather than gently discourage densification. Watch `sae_mean_l0` (average
-active latents per token, logged every validation step) after changing this
-weight or moving to a wider SAE than the ones used here — it should drift
-gradually, not collapse toward 0 or jump to "most of the dictionary counts as
-active."
+The sparsity weight is only an approximate starting point — raw L1 magnitude
+scales with dictionary width (thousands of dimensions) and is typically far
+larger than the reconstruction MSE, so an over-weighted term will crush the
+SAE toward near-zero activity. Watch `sae_mean_l0` (average active latents
+per token, logged every validation step) after changing this weight or
+moving to a wider SAE — it should drift gradually, not collapse toward 0 or
+jump to "most of the dictionary counts as active." The L1 form itself is a
+deliberately generic, architecture-agnostic choice — the releases used here
+are TopK/JumpReLU-style, which enforce sparsity architecturally rather than
+via L1, so this term is an additional soft regularizer for those rather than
+a reproduction of their native training objective (`sae.cfg.architecture`
+reports the true architecture, if you want to specialize this).
 
-The L1 form itself is a deliberately generic, architecture-agnostic choice.
-It's the traditional sparsity loss for "standard"/"gated" SAEs, but the
-releases used here are TopK/JumpReLU-style, which enforce sparsity
-architecturally (hard top-k selection, or a learned per-feature threshold)
-rather than via L1 — so this term acts as an additional soft regularizer for
-those rather than a reproduction of their native training objective. If you
-know a given release's exact architecture (`sae.cfg.architecture` reports it)
-and want to match it exactly, `FrozenSAE.training_losses` is the place to
-specialize it.
+Trained SAE states save to `<run_dir>/trained_sae/layer_<l>.pt` and are
+picked up automatically by `evaluate.py` when that directory exists alongside
+the adapter — no separate flag needed at evaluation time.
 
-Trained SAE states are saved to `<run_dir>/trained_sae/layer_<l>.pt` and
-picked up automatically by `evaluate.py` when it finds that directory
-alongside the adapter — no separate flag needed at evaluation time.
+### `--sae_reg` details
+
+Keeps the SAE frozen (never calls `make_trainable()`) and adds only the
+**reconstruction** half of `FrozenSAE.training_losses(...)` (same weight,
+`sae_recon_loss_weight`) to the total loss. No sparsity term here — nothing
+about the SAE's own dictionary is being trained, so there's no densification
+failure mode to guard against; only reconstruction fidelity is at risk, and
+that's exactly what this term protects. Nothing is saved beyond the adapter —
+there's no SAE checkpoint, because the SAE never changes.
+
+Both options only do anything for C3/C4 (`train.py` prints a message and
+ignores either flag for C1/C2, which don't use the SAE in their loss at all
+— matched by `run_ablation.py`'s own flags, which apply the same rule so its
+expected run_ids stay in sync with what `train.py` actually saves).
 
 ## Data discipline
 
@@ -139,9 +172,10 @@ PAWS `labeled_final`'s own train/validation/test splits are used properly:
   invariance loss (attractive and repulsive respectively — see above).
 - **validation**: periodic checks during training (every `eval_every` steps):
   LM perplexity, SAE-space same/diff AUROC (the collapse check), mean
-  same/diff SAE-cosine-distance, and SAE reconstruction variance explained
-  (the frozen-SAE-drift check) — all still plain diagnostics, unaffected by
-  the loss formulation changes above.
+  same/diff SAE-cosine-distance, SAE reconstruction variance explained (the
+  drift check), and average active latents per token (the sparsity check) —
+  all still plain diagnostics, unaffected by the loss formulation changes
+  above.
 - **test**: untouched until `evaluate.py`, which re-runs Step 1's *exact*
   measurement pipeline on it — same metrics, same sampling, same protocol —
   so before/after is a clean comparison on data the model never saw.
@@ -177,11 +211,12 @@ tree.
 **Nothing in the training path is wrapped in `torch.no_grad()`.** The SAE's
 own parameters are frozen via `requires_grad_(False)` by default
 (`frozen_sae.py`), not via disabling autograd on `encode()`/`decode()` — the
-latter would break gradient flow from the invariance loss back into the LoRA
-parameters (and, with `--joint_sae`, into the SAE's own weights). Autograd
-still computes gradients *with respect to the SAE's input* regardless of
-whether the SAE's own weights require grad — the same pattern as using a
-frozen perceptual-loss network. Only diagnostic/eval code (`evaluate.py`, the
+latter would break gradient flow from the invariance loss (and, with
+`--sae_reg`, the reconstruction regularizer) back into the LoRA parameters.
+Autograd still computes gradients *with respect to the SAE's input*
+regardless of whether the SAE's own weights require grad — the same pattern
+as using a frozen perceptual-loss network, or a frozen reference model in a
+KL-regularized RL objective. Only diagnostic/eval code (`evaluate.py`, the
 SAE-drift check, `reconstruction_variance_explained`) explicitly wraps itself
 in `no_grad()`.
 
@@ -195,18 +230,22 @@ activations outside float16's representable range and produce
 worse-than-random-guessing loss. See `debug_pythia_loss.py` if a new model
 ever shows a similar symptom (loss above `ln(vocab_size)`).
 
-## Watch during training: is the (frozen or jointly-trained) SAE still valid?
+## Watch during training: is the SAE still valid?
 
-The SAE starts fit to the *original* model's activations. As training
-proceeds, activations drift, and the SAE's reconstruction of them can
-degrade — tracked directly via `sae_variance_explained` in the training log.
-Without `--joint_sae`, a falling value is a real finding: it means the
-frozen-SAE assumption is breaking down for this model/layer/lambda and
-results at that point shouldn't be trusted much either way, since the
-"ruler" being used to measure the effect is itself no longer working well.
-With `--joint_sae`, this same number becomes the direct check on whether the
-reconstruction anchor is actually doing its job — it should stay high;
-if it doesn't, `sae_recon_loss_weight` likely needs to be larger.
+`sae_variance_explained` in the training log is the number to watch,
+regardless of mode:
+
+- **Default (frozen, no regularizer)**: a falling value is a real finding —
+  it means the frozen-SAE assumption is breaking down for this
+  model/layer/lambda, and results at that point shouldn't be trusted much
+  either way, since the "ruler" measuring the effect is itself no longer
+  working well.
+- **`--sae_reg`**: this is the number the regularizer is directly fighting to
+  keep high. If it still falls noticeably, `sae_recon_loss_weight` likely
+  needs to be larger (or `lam` is too aggressive for this weight to counter).
+- **`--joint_sae`**: should stay high close to by construction (the SAE is
+  actively being trained to keep it that way). If it doesn't, the anchor
+  terms need more weight relative to the invariance loss.
 
 ## Running
 
@@ -217,21 +256,25 @@ environment.
 ```bash
 pip install -r requirements.txt
 
-python sanity_check.py              # a few optimizer steps per model, frozen AND --joint_sae paths,
-                                       # checks gradients actually flow to the right places in both
+python sanity_check.py              # a few optimizer steps per model, across all three SAE-handling
+                                       # modes, checks gradients (and non-gradients) reach the right places
 
 python train.py --model gpt2-small --condition C3_sae_magnitude --lam 1.0
 python train.py --model gpt2-small --condition C4_sae_magnitude_support --lam 1.0 --joint_sae
+python train.py --model gpt2-small --condition C4_sae_magnitude_support --lam 1.0 --sae_reg
 
 python evaluate.py --model gpt2-small --run_id baseline
 python evaluate.py --model gpt2-small --run_id gpt2-small__C3_sae_magnitude__lam1.0 \
     --adapter_path results/step2_llm/gpt2-small__C3_sae_magnitude__lam1.0/adapter
 # --joint_sae runs: same evaluate.py call, no extra flag -- the trained_sae/
 # checkpoint next to the adapter is picked up automatically.
+# --sae_reg runs: same evaluate.py call too -- nothing special to pick up,
+# since the SAE never changed.
 
 python run_ablation.py --quick                  # one lambda per condition, all three models
 python run_ablation.py                            # the full grid (expensive)
 python run_ablation.py --joint_sae --quick          # same, with joint SAE training for C3/C4
+python run_ablation.py --sae_reg --quick              # same, with the frozen-SAE regularizer for C3/C4
 ```
 
 ## Decision gate
@@ -249,9 +292,12 @@ python run_ablation.py --joint_sae --quick          # same, with joint SAE train
   still drops toward `mean_same_sae_cos` in the training log) → try a larger
   `repulsive_margin` before concluding the approach doesn't work; the current
   default (0.5) is a starting point, not a tuned value.
-- **`sae_variance_explained` degrades badly without `--joint_sae`, but stays
-  healthy with it** → the frozen-SAE assumption was the actual bottleneck for
-  that model/layer, and joint training is worth keeping on by default there.
+- **`sae_variance_explained` degrades badly by default** → the frozen-SAE
+  assumption was the bottleneck for that model/layer. Prefer `--sae_reg` as
+  the fix if the goal is keeping the SAE itself unchanged for evaluation;
+  reach for `--joint_sae` only if you specifically want to study co-adapted
+  model+dictionary behavior instead (see "Keeping the SAE valid" above for
+  why these aren't interchangeable).
 - **`sae_mean_l0` collapses toward 0 or balloons toward the full dictionary
   width with `--joint_sae`** → `sparsity_loss_weight` is off (too high or too
   low respectively) for this SAE's actual scale; retune before trusting that

@@ -5,34 +5,58 @@ Each step draws one WikiText batch and (for C2-C4) one PAWS same-meaning batch
 AND one PAWS diff-meaning batch, combining all of it into a single backward pass:
 
     total_loss = lm_loss(wikitext_batch)
-               + lambda * [ invariance_loss(same_batch, diff_batch) (+ support) ]
+               + lambda * [ attractive(same_batch) + repulsive(diff_batch) (+ support) ]
                + (only with --joint_sae) sae_recon_loss_weight * reconstruction
                + (only with --joint_sae) sparsity_loss_weight * sparsity
+               + (only with --sae_reg)   sae_recon_loss_weight * reconstruction
+
+Three mutually exclusive ways to handle the SAE during training (default is
+the first):
+  1. Frozen, no extra loss term. Simplest, but sae_variance_explained in the
+     training log can degrade as the model's activations drift away from what
+     the SAE was originally fit to -- watch for this rather than assume it away.
+  2. --joint_sae: let the SAE adapt to the drifting model. Keeps reconstruction
+     high by construction, but the SAE's own dictionary changes, so the
+     baseline and trained checkpoints are evaluated with two different SAEs
+     (see trained_sae/ below) -- and some of any measured invariance gain
+     could come from the SAE's own projection adapting rather than the
+     model's actual representations changing.
+  3. --sae_reg: keep the SAE frozen (nothing to save, nothing changes) and
+     instead add its reconstruction loss on the model's current activations
+     as a regularizer on the MODEL -- gradient flows through the frozen SAE
+     into the LoRA parameters, penalizing drift away from the region the SAE
+     can reconstruct, the same way a KL-to-reference-policy penalty works in
+     RL fine-tuning. The SAE used for evaluation is then guaranteed identical,
+     unchanged, before and after -- the more direct fix if the goal is
+     specifically keeping the SAE valid as a fixed measurement yardstick.
 
 See losses.py for why the repulsive term uses a margin/hinge rather than an
 unbounded "maximize distance" objective, and frozen_sae.py's training_losses
-for why joint SAE training needs both a reconstruction anchor (to avoid a
-trivial collapsed solution) and a sparsity term (to avoid just getting denser
-as an easy way to reduce reconstruction error).
+for the reconstruction/sparsity formulas used by both --joint_sae and
+--sae_reg (sae_reg only uses the reconstruction half -- there's no SAE
+dictionary being trained for a sparsity term to regularize).
 
-Produces, under results/step2_llm/<model>__<condition>__lam<lambda>[__jointsae]/:
+Produces, under results/step2_llm/<model>__<condition>__lam<lambda>[__jointsae|__saereg]/:
   - adapter/               the trained LoRA adapter (not the full model)
   - trained_sae/            (only with --joint_sae) one state dict per invariance
                             layer's SAE, as it ended training -- evaluate.py picks
-                            these up automatically if present for a given run_id
+                            these up automatically if present for a given run_id.
+                            --sae_reg has no equivalent: its SAE never changes.
   - training_log.json      periodic validation checks: LM perplexity, SAE-space
                             same/diff AUROC (the collapse check -- this should
                             WIDEN over training, not shrink), mean same/diff
                             SAE-cosine-distance, SAE reconstruction variance
-                            explained (the frozen-SAE-drift check), average
-                            active latents per token (sae_mean_l0 -- the
-                            sparsity check, most relevant with --joint_sae),
-                            and the attractive/repulsive/support/reconstruction/
-                            sparsity loss components.
+                            explained (the frozen-SAE-drift check -- this is
+                            the number --sae_reg and --joint_sae are each
+                            trying to keep healthy, by two different means),
+                            average active latents per token (sae_mean_l0 --
+                            the sparsity check, only meaningful with
+                            --joint_sae), and the loss components.
 
 Usage:
     python train.py --model gpt2-small --condition C3_sae_magnitude --lam 1.0
     python train.py --model gpt2-small --condition C4_sae_magnitude_support --lam 1.0 --joint_sae
+    python train.py --model gpt2-small --condition C4_sae_magnitude_support --lam 1.0 --sae_reg
 """
 
 import argparse
@@ -103,67 +127,107 @@ def run_validation_checks(
     val_batch = wikitext_val_batcher.next_batch(8)
     ppl = torch.exp(lm_loss(peft_model, val_batch)).item()
 
-    layer = inv_layers[0]  # monitor the first invariance layer; training may use more than one
     sentences = dict(
         a_same=[p.sentence_a for p in val_same_pairs],
         b_same=[p.sentence_b for p in val_same_pairs],
         a_diff=[p.sentence_a for p in val_diff_pairs],
         b_diff=[p.sentence_b for p in val_diff_pairs],
     )
+
     acts = {
-        k: get_multi_layer_activations(hf_model, tokenizer, v, [layer], model_family, hook_side, device)[layer]
+        k: get_multi_layer_activations(
+            hf_model,
+            tokenizer,
+            v,
+            inv_layers,
+            model_family,
+            hook_side,
+            device,
+        )
         for k, v in sentences.items()
     }
 
-    sae = saes[layer]
-    same_cos = (
-        cosine_distance(pool_sae_codes(sae, acts["a_same"]), pool_sae_codes(sae, acts["b_same"]))
-        .cpu()
-        .numpy()
-    )
-    diff_cos = (
-        cosine_distance(pool_sae_codes(sae, acts["a_diff"]), pool_sae_codes(sae, acts["b_diff"]))
-        .cpu()
-        .numpy()
-    )
-    auroc_sae, _ = discrimination_auroc(same_cos, diff_cos)
+    aurocs = []
+    same_coss = []
+    diff_coss = []
+    vars_explained = []
+    mean_l0s = []
 
-    all_same_tokens = torch.cat(acts["a_same"] + acts["b_same"], dim=0)
-    var_explained = sae.reconstruction_variance_explained(all_same_tokens)
-    mean_l0 = sae.mean_l0(all_same_tokens)
+    for layer in inv_layers:
+        sae = saes[layer]
+
+        same_cos = cosine_distance(
+            pool_sae_codes(sae, acts["a_same"][layer]),
+            pool_sae_codes(sae, acts["b_same"][layer]),
+        ).cpu().numpy()
+
+        diff_cos = cosine_distance(
+            pool_sae_codes(sae, acts["a_diff"][layer]),
+            pool_sae_codes(sae, acts["b_diff"][layer]),
+        ).cpu().numpy()
+
+        auroc_sae, _ = discrimination_auroc(same_cos, diff_cos)
+
+        all_same_tokens = torch.cat(
+            acts["a_same"][layer] + acts["b_same"][layer],
+            dim=0,
+        )
+
+        aurocs.append(auroc_sae)
+        same_coss.append(same_cos.mean())
+        diff_coss.append(diff_cos.mean())
+        vars_explained.append(
+            sae.reconstruction_variance_explained(all_same_tokens).item()
+        )
+        mean_l0s.append(
+            sae.mean_l0(all_same_tokens).item()
+        )
 
     peft_model.train()
-    return dict(
-        perplexity=ppl,
-        auroc_sae=float(auroc_sae),
-        mean_same_sae_cos=float(same_cos.mean()),
-        mean_diff_sae_cos=float(diff_cos.mean()),
-        sae_variance_explained=float(var_explained),
-        sae_mean_l0=float(mean_l0),
-    )
+
+    return {
+        "perplexity": ppl,
+        "auroc_sae": float(sum(aurocs) / len(aurocs)),
+        "mean_same_sae_cos": float(sum(same_coss) / len(same_coss)),
+        "mean_diff_sae_cos": float(sum(diff_coss) / len(diff_coss)),
+        "sae_variance_explained": float(sum(vars_explained) / len(vars_explained)),
+        "sae_mean_l0": float(sum(mean_l0s) / len(mean_l0s)),
+    }
 
 
-def run(model_key: str, condition: str, lam: float, joint_sae: bool, seed: int = 0) -> None:
+def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bool, seed: int = 0) -> None:
     torch.manual_seed(seed)
+    assert not (joint_sae and sae_reg), (
+        "--joint_sae and --sae_reg are mutually exclusive: they're two different answers to the same "
+        "problem (joint_sae adapts the SAE to the drifting model; sae_reg holds the SAE fixed and "
+        "penalizes the model for drifting away from it). Pick one."
+    )
     model_cfg = MODEL_CONFIGS[model_key]
     spec = CONDITION_SPECS[condition]
     inv_layers = INVARIANCE_LAYERS[model_key]
     device = resolve_device(TRAIN_CONFIG["device"])
-    tag = f"[{model_key}/{condition}/lam={lam}{'/joint_sae' if joint_sae else ''}]"
+    mode_tag = "/joint_sae" if joint_sae else "/sae_reg" if sae_reg else ""
+    tag = f"[{model_key}/{condition}/lam={lam}{mode_tag}]"
 
-    # if joint_sae and not spec["use_invariance"]:
-    #     print(f"{tag} --joint_sae has no effect on {condition}: it never uses the SAE in its loss. Proceeding without it.")
+    # sae_option_applies = spec["use_invariance"] and spec["space"] == "sae"
+    # if joint_sae and not sae_option_applies:
+    #     print(f"{tag} --joint_sae has no effect on {condition}: its invariance loss doesn't run through the "
+    #           f"SAE. Proceeding without it.")
     #     joint_sae = False
-    # if joint_sae and spec["space"] != "sae":
-    #     print(f"{tag} --joint_sae has no effect on {condition}: its invariance loss is computed in raw space, "
-    #           f"not through the SAE. Proceeding without it.")
-    #     joint_sae = False
+    # if sae_reg and not sae_option_applies:
+    #     print(f"{tag} --sae_reg has no effect on {condition}: its invariance loss doesn't run through the "
+    #           f"SAE, so there's nothing to regularize the model against. Proceeding without it.")
+    #     sae_reg = False
 
     print(f"{tag} loading SAEs ...")
     saes = load_layer_saes(model_cfg, device, inv_layers)
     if joint_sae:
         for l in inv_layers:
             saes[l].make_trainable()
+    # sae_reg: SAEs stay frozen (the default) -- its reconstruction loss is used
+    # as a regularizer on the MODEL, computed through the SAE without ever
+    # calling make_trainable() on it, same frozen-module-inside-a-loss pattern
+    # already used for the invariance loss itself.
 
     print(f"{tag} loading LoRA model ...")
     tokenizer = load_tokenizer(model_cfg)
@@ -255,6 +319,24 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, seed: int =
                 )
                 inv_components["sae_recon_loss"] = recon_loss.item()
                 inv_components["sae_sparsity_loss"] = sparsity_loss.item()
+
+            if sae_reg:
+                # Same reconstruction term as joint_sae's anchor, but the SAE
+                # was never made trainable, so this gradient has nowhere to go
+                # except back through the (frozen) SAE into the activations --
+                # i.e. into the LoRA parameters that produced them. This is
+                # what actually regularizes the MODEL to stay in the region
+                # the fixed SAE can reconstruct, rather than adapting the SAE
+                # to wherever the model drifts. No sparsity term here: nothing
+                # about the SAE's own dictionary is being trained, so there's
+                # no densification failure mode to guard against -- only
+                # reconstruction fidelity is the thing at risk.
+                recon_loss = torch.tensor(0.0, device=device)
+                for l in inv_layers:
+                    all_acts = torch.cat(same_acts_a[l] + same_acts_b[l] + diff_acts_a[l] + diff_acts_b[l], dim=0)
+                    recon_loss = recon_loss + saes[l].training_losses(all_acts)["reconstruction"]
+                total_loss = total_loss + TRAIN_CONFIG["sae_recon_loss_weight"] * recon_loss
+                inv_components["sae_reg_recon_loss"] = recon_loss.item()
         else:
             loss_inv = torch.tensor(0.0)
             inv_components = {}
@@ -278,11 +360,13 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, seed: int =
                 f"sae_var_explained={checks['sae_variance_explained']:.3f} sae_mean_l0={checks['sae_mean_l0']:.1f}"
             )
 
-    run_id = f"{model_key}__{condition}__lam{lam}" + ("__jointsae" if joint_sae else "")
+    run_id = f"{model_key}__{condition}__lam{lam}" + ("__jointsae" if joint_sae else "__saereg" if sae_reg else "")
     out_dir = os.path.join(TRAIN_CONFIG["output_dir"], run_id)
     os.makedirs(out_dir, exist_ok=True)
     peft_model.save_pretrained(os.path.join(out_dir, "adapter"))
     if joint_sae:
+        # sae_reg has no equivalent save step -- its SAE never changes, so
+        # evaluate.py's fresh pretrained SAE is already the correct one to use.
         sae_dir = os.path.join(out_dir, "trained_sae")
         os.makedirs(sae_dir, exist_ok=True)
         for l in inv_layers:
@@ -299,7 +383,16 @@ if __name__ == "__main__":
     parser.add_argument("--lam", type=float, default=1.0)
     parser.add_argument("--joint_sae", action="store_true",
                          help="Also train the invariance layer(s)' SAE, instead of keeping it frozen. "
-                              "Only meaningful for conditions whose invariance loss runs through the SAE (C3/C4).")
+                              "Only meaningful for conditions whose invariance loss runs through the SAE (C3/C4). "
+                              "Mutually exclusive with --sae_reg.")
+    parser.add_argument("--sae_reg", action="store_true",
+                         help="Keep the SAE frozen (as by default) but add its reconstruction loss on the "
+                              "model's current activations to the total loss, regularizing the MODEL to stay "
+                              "in the region the fixed SAE can reconstruct, rather than letting the SAE go "
+                              "stale as the model drifts. Only meaningful for C3/C4. Mutually exclusive with "
+                              "--joint_sae. This is the recommended default if the goal is specifically to "
+                              "keep the SAE valid for evaluation, since the SAE used at evaluation time is "
+                              "then guaranteed identical to the one used at the start of training.")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-    run(args.model, args.condition, args.lam, args.joint_sae, args.seed)
+    run(args.model, args.condition, args.lam, args.joint_sae, args.sae_reg, args.seed)
