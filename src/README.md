@@ -114,6 +114,27 @@ instead). The reasoning:
   just uses the same fresh pretrained SAE it always would, since nothing
   about it ever changed.
 
+### Both anchor/regularizer terms cover WikiText activations too, not just PAWS
+
+Whichever mode is active, its reconstruction (and, for `--joint_sae`,
+sparsity) term is computed on a mix of the current step's PAWS activations
+*and* that step's WikiText-batch activations at the invariance layer(s) —
+not PAWS alone. This matters because the LM loss trains on WikiText every
+single step; if the anchor/regularizer never saw that distribution, the model
+would be free to drift on general text however it liked while still looking
+perfectly healthy on the narrow PAWS slice the check was actually watching.
+
+The WikiText activations are obtained "for free": `capture_layer_
+activations_during` (`hooked_activations.py`) registers hooks on the
+invariance layer(s) around the LM loss's own forward pass, so this doesn't
+cost a second forward pass over the WikiText batch — it just reads off
+activations that were already being computed to produce the LM loss in the
+first place, and confirmed (via an isolated test with a small hooked model)
+to remain fully connected to the autograd graph, not detached copies. The
+periodic validation diagnostics (`sae_variance_explained`, `sae_mean_l0` in
+the training log) mix in a WikiText validation batch the same way, so the
+health checks reflect the same broadened coverage the training loss does.
+
 ### `--joint_sae` details
 
 Unfreezes the invariance layer(s)' SAE and adds it to the optimizer (own,
@@ -233,7 +254,9 @@ ever shows a similar symptom (loss above `ln(vocab_size)`).
 ## Watch during training: is the SAE still valid?
 
 `sae_variance_explained` in the training log is the number to watch,
-regardless of mode:
+regardless of mode — and now reflects a mix of PAWS and WikiText activations
+(see above), so a healthy value means the SAE is holding up across both, not
+just the narrower PAWS slice:
 
 - **Default (frozen, no regularizer)**: a falling value is a real finding —
   it means the frozen-SAE assumption is breaking down for this

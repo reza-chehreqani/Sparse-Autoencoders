@@ -96,6 +96,40 @@ class ResidualStreamRecorder:
         self._handle.remove()
 
 
+def capture_layer_activations_during(hf_model, layers: Sequence[int], model_family: str, hook_side: str, forward_call):
+    """
+    Registers recorders on `layers`, calls `forward_call()` (a zero-arg
+    callable expected to trigger a forward pass through hf_model -- e.g. via
+    a wrapping PeftModel's __call__), and returns
+    `(forward_call's return value, {layer: captured_tensor})`.
+
+    This exists so a forward pass that's already happening for another reason
+    -- the LM loss's forward pass over a WikiText batch, in train.py -- can
+    also yield the invariance layer(s)' activations on that same batch,
+    without a second forward pass. Used to extend the SAE reconstruction/
+    sparsity anchor terms (--joint_sae, --sae_reg) to cover the general-text
+    distribution the LM loss actually trains on, not only the narrower PAWS
+    sentence distribution the invariance loss uses -- the model's activations
+    can drift on the former even while the latter looks fine, since the LM
+    loss pushes on every step and the invariance loss's anchor previously
+    never saw that distribution at all.
+
+    Captured tensors keep whatever shape the hook naturally produces (e.g.
+    [batch, seq_len, d_model] for a padded/fixed-length batch) -- unlike
+    get_multi_layer_activations, which returns per-sentence lists from
+    unbatched single-sentence forward passes.
+    """
+    transformer_layers = get_transformer_layers(hf_model, model_family)
+    recorders = {layer: ResidualStreamRecorder(transformer_layers[layer], hook_side) for layer in layers}
+    try:
+        result = forward_call()
+        captured = {layer: recorders[layer].captured for layer in layers}
+        return result, captured
+    finally:
+        for r in recorders.values():
+            r.remove()
+
+
 def get_multi_layer_activations(
     hf_model,
     tokenizer,

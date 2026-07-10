@@ -69,7 +69,7 @@ import torch
 from config import CONDITION_SPECS, INVARIANCE_LAYERS, MODEL_CONFIGS, PAWS_CONFIG, TRAIN_CONFIG, WIKITEXT_CONFIG
 from frozen_sae import load_layer_saes
 from hf_model_loading import load_lora_model, load_tokenizer, resolve_device
-from hooked_activations import get_multi_layer_activations
+from hooked_activations import capture_layer_activations_during, get_multi_layer_activations
 from lm_dataset import WikiTextBatcher, load_wikitext_train_text
 from losses import invariance_loss, lm_loss, pool_sae_codes, ScaledCosineBCELoss
 from metrics import cosine_distance, discrimination_auroc
@@ -124,10 +124,17 @@ def run_validation_checks(
 ) -> dict:
     peft_model.eval()
 
+    layer = inv_layers[0]  # monitor the first invariance layer; training may use more than one
     val_batch = wikitext_val_batcher.next_batch(8)
-    ppl = torch.exp(lm_loss(peft_model, val_batch)).item()
+    # Piggyback on the perplexity forward pass to also get this WikiText batch's
+    # activations at the invariance layer, so the drift/sparsity diagnostics
+    # below reflect both distributions the model actually trains on, not just
+    # PAWS -- same reasoning as the training loop's anchor/regularizer terms.
+    lm_loss_value, wikitext_acts = capture_layer_activations_during(
+        hf_model, [layer], model_family, hook_side, lambda: lm_loss(peft_model, val_batch),
+    )
+    ppl = torch.exp(lm_loss_value).item()
 
-    # layer = inv_layers[0]  # monitor the first invariance layer; training may use more than one
     sentences = dict(
         a_same=[p.sentence_a for p in val_same_pairs],
         b_same=[p.sentence_b for p in val_same_pairs],
@@ -135,49 +142,38 @@ def run_validation_checks(
         b_diff=[p.sentence_b for p in val_diff_pairs],
     )
     acts = {
-        k: get_multi_layer_activations(hf_model, tokenizer, v, inv_layers, model_family, hook_side, device)
+        k: get_multi_layer_activations(hf_model, tokenizer, v, [layer], model_family, hook_side, device)[layer]
         for k, v in sentences.items()
     }
 
-    aurocs = []
-    same_coss = []
-    diff_coss = []
-    vars_explained = []
-    mean_l0s = []
+    sae = saes[layer]
+    same_cos = (
+        cosine_distance(pool_sae_codes(sae, acts["a_same"]), pool_sae_codes(sae, acts["b_same"]))
+        .cpu()
+        .numpy()
+    )
+    diff_cos = (
+        cosine_distance(pool_sae_codes(sae, acts["a_diff"]), pool_sae_codes(sae, acts["b_diff"]))
+        .cpu()
+        .numpy()
+    )
+    auroc_sae, _ = discrimination_auroc(same_cos, diff_cos)
 
-    for layer in inv_layers:
-        sae = saes[layer]
-
-        same_cos = cosine_distance(
-            pool_sae_codes(sae, acts["a_same"][layer]),
-            pool_sae_codes(sae, acts["b_same"][layer]),
-        ).cpu().numpy()
-
-        diff_cos = cosine_distance(
-            pool_sae_codes(sae, acts["a_diff"][layer]),
-            pool_sae_codes(sae, acts["b_diff"][layer]),
-        ).cpu().numpy()
-
-        auroc_sae, _ = discrimination_auroc(same_cos, diff_cos)
-
-        all_same_tokens = torch.cat(acts["a_same"][layer] + acts["b_same"][layer], dim=0)
-
-        aurocs.append(auroc_sae)
-        same_coss.append(same_cos.mean())
-        diff_coss.append(diff_cos.mean())
-        vars_explained.append(sae.reconstruction_variance_explained(all_same_tokens).item())
-        mean_l0s.append(sae.mean_l0(all_same_tokens).item())
+    all_same_tokens = torch.cat(acts["a_same"] + acts["b_same"], dim=0)
+    wikitext_tokens_flat = wikitext_acts[layer].reshape(-1, wikitext_acts[layer].shape[-1])
+    drift_check_tokens = torch.cat([all_same_tokens, wikitext_tokens_flat], dim=0)
+    var_explained = sae.reconstruction_variance_explained(drift_check_tokens)
+    mean_l0 = sae.mean_l0(drift_check_tokens)
 
     peft_model.train()
-
-    return {
-        "perplexity": ppl,
-        "auroc_sae": float(sum(aurocs) / len(aurocs)),
-        "mean_same_sae_cos": float(sum(same_coss) / len(same_coss)),
-        "mean_diff_sae_cos": float(sum(diff_coss) / len(diff_coss)),
-        "sae_variance_explained": float(sum(vars_explained) / len(vars_explained)),
-        "sae_mean_l0": float(sum(mean_l0s) / len(mean_l0s)),
-    }
+    return dict(
+        perplexity=ppl,
+        auroc_sae=float(auroc_sae),
+        mean_same_sae_cos=float(same_cos.mean()),
+        mean_diff_sae_cos=float(diff_cos.mean()),
+        sae_variance_explained=float(var_explained),
+        sae_mean_l0=float(mean_l0),
+    )
 
 
 def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bool, seed: int = 0) -> None:
@@ -203,6 +199,10 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
     #     print(f"{tag} --sae_reg has no effect on {condition}: its invariance loss doesn't run through the "
     #           f"SAE, so there's nothing to regularize the model against. Proceeding without it.")
     #     sae_reg = False
+
+    # Only worth the (small) overhead of hooking the LM forward pass when an
+    # anchor/regularizer term actually exists to feed those activations into.
+    need_lm_sae_anchor = joint_sae or sae_reg
 
     print(f"{tag} loading SAEs ...")
     saes = load_layer_saes(model_cfg, device, inv_layers)
@@ -253,7 +253,21 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
     log = []
     for step in range(TRAIN_CONFIG["max_steps"]):
         lm_batch = wikitext_train_batcher.next_batch(TRAIN_CONFIG["batch_size_lm"])
-        loss_lm = lm_loss(peft_model, lm_batch)
+        if need_lm_sae_anchor:
+            # Piggybacks on the LM loss's own forward pass to also capture the
+            # invariance layer(s)' activations on this WikiText batch, at no
+            # extra forward-pass cost -- see hooked_activations.
+            # capture_layer_activations_during's docstring for why this
+            # matters: without it, the SAE anchor/regularizer only ever sees
+            # the narrow PAWS sentence distribution, never the general text
+            # the LM loss is actually training on every step.
+            loss_lm, lm_layer_acts = capture_layer_activations_during(
+                hf_model, inv_layers, model_cfg.model_family, model_cfg.hook_side,
+                lambda: lm_loss(peft_model, lm_batch),
+            )
+        else:
+            loss_lm = lm_loss(peft_model, lm_batch)
+            lm_layer_acts = None
 
         if spec["use_invariance"]:
             same_batch = sample_batch(train_same, TRAIN_CONFIG["batch_size_invariance"], rng_state, "train_same")
@@ -289,12 +303,25 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
 
             total_loss = loss_lm + lam * loss_inv
 
+            if joint_sae or sae_reg:
+                # Shared across both modes: PAWS (same + diff meaning) activations
+                # plus, when available, this step's WikiText activations -- the
+                # anchor/regularizer sees the same mix of distributions the rest
+                # of training does, not just the narrower PAWS slice.
+                anchor_acts = {}
+                for l in inv_layers:
+                    paws_acts = torch.cat(same_acts_a[l] + same_acts_b[l] + diff_acts_a[l] + diff_acts_b[l], dim=0)
+                    if lm_layer_acts is not None:
+                        lm_acts_flat = lm_layer_acts[l].reshape(-1, lm_layer_acts[l].shape[-1])
+                        anchor_acts[l] = torch.cat([paws_acts, lm_acts_flat], dim=0)
+                    else:
+                        anchor_acts[l] = paws_acts
+
             if joint_sae:
                 recon_loss = torch.tensor(0.0, device=device)
                 sparsity_loss = torch.tensor(0.0, device=device)
                 for l in inv_layers:
-                    all_acts = torch.cat(same_acts_a[l] + same_acts_b[l] + diff_acts_a[l] + diff_acts_b[l], dim=0)
-                    sae_losses = saes[l].training_losses(all_acts)
+                    sae_losses = saes[l].training_losses(anchor_acts[l])
                     recon_loss = recon_loss + sae_losses["reconstruction"]
                     sparsity_loss = sparsity_loss + sae_losses["sparsity"]
                 total_loss = (
@@ -309,17 +336,17 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
                 # Same reconstruction term as joint_sae's anchor, but the SAE
                 # was never made trainable, so this gradient has nowhere to go
                 # except back through the (frozen) SAE into the activations --
-                # i.e. into the LoRA parameters that produced them. This is
-                # what actually regularizes the MODEL to stay in the region
-                # the fixed SAE can reconstruct, rather than adapting the SAE
-                # to wherever the model drifts. No sparsity term here: nothing
-                # about the SAE's own dictionary is being trained, so there's
-                # no densification failure mode to guard against -- only
-                # reconstruction fidelity is the thing at risk.
+                # i.e. into the LoRA parameters that produced them (both the
+                # PAWS-batch and, via lm_layer_acts, the WikiText-batch ones).
+                # This is what actually regularizes the MODEL to stay in the
+                # region the fixed SAE can reconstruct, rather than adapting
+                # the SAE to wherever the model drifts. No sparsity term here:
+                # nothing about the SAE's own dictionary is being trained, so
+                # there's no densification failure mode to guard against --
+                # only reconstruction fidelity is the thing at risk.
                 recon_loss = torch.tensor(0.0, device=device)
                 for l in inv_layers:
-                    all_acts = torch.cat(same_acts_a[l] + same_acts_b[l] + diff_acts_a[l] + diff_acts_b[l], dim=0)
-                    recon_loss = recon_loss + saes[l].training_losses(all_acts)["reconstruction"]
+                    recon_loss = recon_loss + saes[l].training_losses(anchor_acts[l])["reconstruction"]
                 total_loss = total_loss + TRAIN_CONFIG["sae_recon_loss_weight"] * recon_loss
                 inv_components["sae_reg_recon_loss"] = recon_loss.item()
         else:

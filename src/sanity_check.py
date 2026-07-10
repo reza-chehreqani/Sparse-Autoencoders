@@ -15,7 +15,11 @@ checks that:
 
 This catches the "forgot to unfreeze the right parameters", "SAE encode()
 accidentally left under no_grad", and "sae_reg accidentally left the SAE
-trainable" classes of bug before committing to a full training run.
+trainable" classes of bug before committing to a full training run. Also
+exercises capture_layer_activations_during (joint_sae/sae_reg modes only),
+which piggybacks the LM forward pass to feed WikiText-batch activations into
+the anchor/regularizer terms alongside the PAWS ones -- mirrors train.py's
+actual loop rather than a simplified stand-in for it.
 """
 
 import torch
@@ -23,7 +27,7 @@ import torch
 from config import INVARIANCE_LAYERS, MODEL_CONFIGS, TRAIN_CONFIG, WIKITEXT_CONFIG
 from frozen_sae import load_all_layer_saes
 from hf_model_loading import load_lora_model, load_tokenizer, resolve_device
-from hooked_activations import get_multi_layer_activations
+from hooked_activations import capture_layer_activations_during, get_multi_layer_activations
 from lm_dataset import WikiTextBatcher, load_wikitext_train_text
 from losses import invariance_loss, lm_loss
 
@@ -42,6 +46,7 @@ def run_steps(model_key, model_cfg, mode: str):
     device = resolve_device(TRAIN_CONFIG["device"])
     inv_layers = INVARIANCE_LAYERS[model_key][:1]  # just one layer for the smoke test
     layer = inv_layers[0]
+    need_lm_sae_anchor = mode in ("joint_sae", "sae_reg")
 
     saes = load_all_layer_saes(model_cfg, device)
     if mode == "joint_sae":
@@ -68,6 +73,19 @@ def run_steps(model_key, model_cfg, mode: str):
     losses, lora_grad_norms, sae_grad_norms = [], [], []
     for step in range(3):
         lm_batch = batcher.next_batch(2)
+        # Mirrors train.py: piggyback the LM forward pass to also capture this
+        # WikiText batch's activations at the invariance layer, so the anchor/
+        # regularizer terms below see the same distribution the LM loss trains
+        # on, not only the narrower PAWS sentences.
+        if need_lm_sae_anchor:
+            lm_loss_value, lm_layer_acts = capture_layer_activations_during(
+                hf_model, [layer], model_cfg.model_family, model_cfg.hook_side,
+                lambda: lm_loss(peft_model, lm_batch),
+            )
+        else:
+            lm_loss_value = lm_loss(peft_model, lm_batch)
+            lm_layer_acts = None
+
         same_a = get_multi_layer_activations(
             hf_model, tokenizer, [p[0] for p in SAME_MEANING_PAIRS], inv_layers,
             model_cfg.model_family, model_cfg.hook_side, device,
@@ -89,19 +107,22 @@ def run_steps(model_key, model_cfg, mode: str):
             saes[layer], same_a[layer], same_b[layer], diff_a[layer], diff_b[layer],
             space="sae", use_support_term=True, repulsive_margin=TRAIN_CONFIG["repulsive_margin"],
         )
-        loss = lm_loss(peft_model, lm_batch) + 1.0 * inv_total
+        loss = lm_loss_value + 1.0 * inv_total
+
+        if need_lm_sae_anchor:
+            paws_acts = torch.cat(same_a[layer] + same_b[layer] + diff_a[layer] + diff_b[layer], dim=0)
+            lm_acts_flat = lm_layer_acts[layer].reshape(-1, lm_layer_acts[layer].shape[-1])
+            anchor_acts = torch.cat([paws_acts, lm_acts_flat], dim=0)
 
         if mode == "joint_sae":
-            all_acts = torch.cat(same_a[layer] + same_b[layer] + diff_a[layer] + diff_b[layer], dim=0)
-            sae_losses = saes[layer].training_losses(all_acts)
+            sae_losses = saes[layer].training_losses(anchor_acts)
             loss = (
                 loss
                 + TRAIN_CONFIG["sae_recon_loss_weight"] * sae_losses["reconstruction"]
                 + TRAIN_CONFIG["sparsity_loss_weight"] * sae_losses["sparsity"]
             )
         elif mode == "sae_reg":
-            all_acts = torch.cat(same_a[layer] + same_b[layer] + diff_a[layer] + diff_b[layer], dim=0)
-            recon = saes[layer].training_losses(all_acts)["reconstruction"]
+            recon = saes[layer].training_losses(anchor_acts)["reconstruction"]
             loss = loss + TRAIN_CONFIG["sae_recon_loss_weight"] * recon
 
         optimizer.zero_grad()
