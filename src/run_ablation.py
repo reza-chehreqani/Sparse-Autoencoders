@@ -48,18 +48,18 @@ def ensure_baseline_evaluated(model_key: str) -> None:
     subprocess.run([sys.executable, "evaluate.py", "--model", model_key, "--run_id", "baseline"], check=True)
 
 
-def summarize(run_ids: list[str], model_key: str, invariance_layer: int) -> None:
+def summarize(run_ids: list[str], model_key: str, invariance_layers: list[int]) -> None:
     print(f"\n{'run_id':<55}{'AUROC_sae(test)':<18}{'delta_vs_baseline':<20}")
     with open(os.path.join(TRAIN_CONFIG["output_dir"], "baseline", "eval", f"{model_key}_layer_stats.json")) as f:
         baseline_stats = {s["layer"]: s for s in json.load(f)}
-    baseline_auroc = baseline_stats[invariance_layer]["auroc_sae"]
+    baseline_auroc = sum(baseline_stats[layer]["auroc_sae"] for layer in invariance_layers) / len(invariance_layers)
     print(f"{'baseline':<55}{baseline_auroc:<18.3f}{'--':<20}")
 
     for run_id in run_ids:
         path = os.path.join(TRAIN_CONFIG["output_dir"], run_id, "eval", f"{model_key}_layer_stats.json")
         with open(path) as f:
             stats = {s["layer"]: s for s in json.load(f)}
-        auroc = stats[invariance_layer]["auroc_sae"]
+        auroc = sum(stats[layer]["auroc_sae"] for layer in invariance_layers) / len(invariance_layers)
         print(f"{run_id:<55}{auroc:<18.3f}{auroc - baseline_auroc:<+20.3f}")
 
 
@@ -104,4 +104,4 @@ if __name__ == "__main__":
             else:
                 for lam in lambdas:
                     run_ids.append(run_one(model_key, condition, lam, joint_sae_here, sae_reg_here))
-        summarize(run_ids, model_key, INVARIANCE_LAYERS[model_key][0])
+        summarize(run_ids, model_key, INVARIANCE_LAYERS[model_key])

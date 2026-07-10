@@ -102,8 +102,8 @@ INVARIANCE_LAYERS = {
 # space: "raw" or "sae" -- which representation the magnitude term is computed on.
 # use_support_term: adds the soft-support (soft-Dice) term; only meaningful for space="sae".
 CONDITION_SPECS = {
-    # "C1_lm_only":               dict(use_invariance=False, space=None,  use_support_term=False),
-    # "C2_raw_invariance":        dict(use_invariance=True,  space="raw", use_support_term=False),
+    "C1_lm_only":               dict(use_invariance=False, space=None,  use_support_term=False),
+    "C2_raw_invariance":        dict(use_invariance=True,  space="raw", use_support_term=False),
     "C3_sae_magnitude":         dict(use_invariance=True,  space="sae", use_support_term=False),
     "C4_sae_magnitude_support": dict(use_invariance=True,  space="sae", use_support_term=True),
 }
