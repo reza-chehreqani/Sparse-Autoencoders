@@ -127,72 +127,44 @@ def run_validation_checks(
     val_batch = wikitext_val_batcher.next_batch(8)
     ppl = torch.exp(lm_loss(peft_model, val_batch)).item()
 
+    layer = inv_layers[0]  # monitor the first invariance layer; training may use more than one
     sentences = dict(
         a_same=[p.sentence_a for p in val_same_pairs],
         b_same=[p.sentence_b for p in val_same_pairs],
         a_diff=[p.sentence_a for p in val_diff_pairs],
         b_diff=[p.sentence_b for p in val_diff_pairs],
     )
-
     acts = {
-        k: get_multi_layer_activations(
-            hf_model,
-            tokenizer,
-            v,
-            inv_layers,
-            model_family,
-            hook_side,
-            device,
-        )
+        k: get_multi_layer_activations(hf_model, tokenizer, v, [layer], model_family, hook_side, device)[layer]
         for k, v in sentences.items()
     }
 
-    aurocs = []
-    same_coss = []
-    diff_coss = []
-    vars_explained = []
-    mean_l0s = []
+    sae = saes[layer]
+    same_cos = (
+        cosine_distance(pool_sae_codes(sae, acts["a_same"]), pool_sae_codes(sae, acts["b_same"]))
+        .cpu()
+        .numpy()
+    )
+    diff_cos = (
+        cosine_distance(pool_sae_codes(sae, acts["a_diff"]), pool_sae_codes(sae, acts["b_diff"]))
+        .cpu()
+        .numpy()
+    )
+    auroc_sae, _ = discrimination_auroc(same_cos, diff_cos)
 
-    for layer in inv_layers:
-        sae = saes[layer]
-
-        same_cos = cosine_distance(
-            pool_sae_codes(sae, acts["a_same"][layer]),
-            pool_sae_codes(sae, acts["b_same"][layer]),
-        ).cpu().numpy()
-
-        diff_cos = cosine_distance(
-            pool_sae_codes(sae, acts["a_diff"][layer]),
-            pool_sae_codes(sae, acts["b_diff"][layer]),
-        ).cpu().numpy()
-
-        auroc_sae, _ = discrimination_auroc(same_cos, diff_cos)
-
-        all_same_tokens = torch.cat(
-            acts["a_same"][layer] + acts["b_same"][layer],
-            dim=0,
-        )
-
-        aurocs.append(auroc_sae)
-        same_coss.append(same_cos.mean())
-        diff_coss.append(diff_cos.mean())
-        vars_explained.append(
-            sae.reconstruction_variance_explained(all_same_tokens).item()
-        )
-        mean_l0s.append(
-            sae.mean_l0(all_same_tokens).item()
-        )
+    all_same_tokens = torch.cat(acts["a_same"] + acts["b_same"], dim=0)
+    var_explained = sae.reconstruction_variance_explained(all_same_tokens)
+    mean_l0 = sae.mean_l0(all_same_tokens)
 
     peft_model.train()
-
-    return {
-        "perplexity": ppl,
-        "auroc_sae": float(sum(aurocs) / len(aurocs)),
-        "mean_same_sae_cos": float(sum(same_coss) / len(same_coss)),
-        "mean_diff_sae_cos": float(sum(diff_coss) / len(diff_coss)),
-        "sae_variance_explained": float(sum(vars_explained) / len(vars_explained)),
-        "sae_mean_l0": float(sum(mean_l0s) / len(mean_l0s)),
-    }
+    return dict(
+        perplexity=ppl,
+        auroc_sae=float(auroc_sae),
+        mean_same_sae_cos=float(same_cos.mean()),
+        mean_diff_sae_cos=float(diff_cos.mean()),
+        sae_variance_explained=float(var_explained),
+        sae_mean_l0=float(mean_l0),
+    )
 
 
 def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bool, seed: int = 0) -> None:
