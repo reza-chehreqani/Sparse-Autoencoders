@@ -22,7 +22,7 @@ from config import CONDITION_SPECS, INVARIANCE_LAYERS, LAMBDA_GRID, MODEL_CONFIG
 
 
 def run_one(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bool) -> str:
-    run_id = f"{model_key}__{condition}__lam{lam}" + ("__jointsae" if joint_sae else "__saereg" if sae_reg else "")
+    run_id = f"{model_key}__{condition}__lam{lam}" #+ ("__jointsae" if joint_sae else "__saereg" if sae_reg else "")
     print(f"=== training {run_id} ===")
     cmd = [sys.executable, "train.py", "--model", model_key, "--condition", condition, "--lam", str(lam)]
     if joint_sae:
