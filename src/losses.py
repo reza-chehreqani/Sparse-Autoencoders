@@ -77,6 +77,9 @@ def soft_support_distance(z_a: torch.Tensor, z_b: torch.Tensor, eps: float = 1e-
     soft_dice = (2 * intersection + eps) / (total + eps)
     return 1.0 - soft_dice
 
+def pairwise_hinge_rank_loss(sim_same, sim_diff, margin=0.5):
+    diff_b, same_b = torch.broadcast_tensors(sim_diff[:, None], sim_same[None, :])
+    return F.relu(margin - (same_b - diff_b)).mean()
 
 def invariance_loss(
     sae,
@@ -127,7 +130,7 @@ def invariance_loss(
         components["bce_loss"] = bce_loss.item()
     
     if use_rank_term:
-        rank_loss = (sim_diff[:, None] - sim_same[None, :]).mean()
+        rank_loss = pairwise_hinge_rank_loss(sim_same, sim_diff)
         total = total + rank_loss
         components["rank_loss"] = rank_loss.item()
 
