@@ -102,11 +102,11 @@ INVARIANCE_LAYERS = {
 # space: "raw" or "sae" -- which representation the magnitude term is computed on.
 # use_support_term: adds the soft-support (soft-Dice) term; only meaningful for space="sae".
 CONDITION_SPECS = {
-    # "C1_lm_only": dict(use_invariance=False, space=None,  use_support_term=False),
-    # "C2_raw_bce": dict(use_invariance=True,  space="raw", use_bce_term=True, use_rank_term=False, use_support_term=False),
+    "C1_lm_only": dict(use_invariance=False, space=None,  use_support_term=False),
+    "C2_raw_bce": dict(use_invariance=True,  space="raw", use_bce_term=True, use_rank_term=False, use_support_term=False),
     "C3_raw_rank": dict(use_invariance=True,  space="raw", use_bce_term=False, use_rank_term=True, use_support_term=False),
     "C4_raw_bce_rank": dict(use_invariance=True,  space="raw", use_bce_term=True, use_rank_term=True, use_support_term=False),
-    # "C5_sae_bce": dict(use_invariance=True,  space="sae", use_bce_term=True, use_rank_term=False, use_support_term=False),
+    "C5_sae_bce": dict(use_invariance=True,  space="sae", use_bce_term=True, use_rank_term=False, use_support_term=False),
     "C6_sae_rank": dict(use_invariance=True,  space="sae", use_bce_term=False, use_rank_term=True, use_support_term=False),
     "C7_sae_bce_rank": dict(use_invariance=True,  space="sae", use_bce_term=True, use_rank_term=True, use_support_term=False),
 }
