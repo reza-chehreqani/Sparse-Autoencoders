@@ -231,14 +231,17 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
         wikitext_texts[-200:], tokenizer, WIKITEXT_CONFIG["max_seq_len"], device, seed=seed + 1
     )
 
+    if spec["use_bce_term"]:
     # Initialize the BCE Criterion
-    bce_criterion = ScaledCosineBCELoss().to(device)
+        bce_criterion = ScaledCosineBCELoss().to(device)
 
-    # Append BCE Criterion parameters to the main optimizer group
-    param_groups = [dict(
-        params=[p for p in peft_model.parameters() if p.requires_grad] + list(bce_criterion.parameters()), 
-        lr=TRAIN_CONFIG["learning_rate"]
-    )]
+        # Append BCE Criterion parameters to the main optimizer group
+        param_groups = [dict(
+            params=[p for p in peft_model.parameters() if p.requires_grad] + list(bce_criterion.parameters()), 
+            lr=TRAIN_CONFIG["learning_rate"]
+        )]
+    else:
+        param_groups = [dict(params=[p for p in peft_model.parameters() if p.requires_grad], lr=TRAIN_CONFIG["learning_rate"])]
     
     if joint_sae:
         sae_params = [p for l in inv_layers for p in saes[l].parameters()]
@@ -300,8 +303,9 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
             inv_components: dict = {}
             for l in inv_layers:
                 l_total, l_components = invariance_loss(
-                    saes[l], same_acts_a[l], same_acts_b[l], diff_acts_a[l], diff_acts_b[l],
-                    spec["space"], spec["use_support_term"], bce_criterion,
+                    saes[l], same_acts_a[l], same_acts_b[l], diff_acts_a[l], diff_acts_b[l], device,
+                    spec["space"], spec["use_support_term"], spec["use_rank_term"], spec["use_bce_term"],
+                    bce_criterion if spec["use_bce_term"] else None
                 )
                 loss_inv = loss_inv + l_total
                 for k, v in l_components.items():

@@ -27,11 +27,7 @@ class ScaledCosineBCELoss(nn.Module):
         self.bias = nn.Parameter(torch.tensor([initial_bias]))
         self.bce = nn.BCEWithLogitsLoss()
 
-    def forward(self, same_a, same_b, diff_a, diff_b):
-        # Calculate cosine similarities
-        sim_same = F.cosine_similarity(same_a, same_b)
-        sim_diff = F.cosine_similarity(diff_a, diff_b)
-        
+    def forward(self, sim_same, sim_diff):
         # Concatenate similarities into a single batch
         sims = torch.cat([sim_same, sim_diff], dim=0)
         
@@ -47,7 +43,7 @@ class ScaledCosineBCELoss(nn.Module):
         # Calculate BCE
         loss = self.bce(logits, labels)
         
-        return loss, sim_same.mean(), sim_diff.mean()
+        return loss
 
 
 def lm_loss(model, input_ids: torch.Tensor) -> torch.Tensor:
@@ -88,8 +84,11 @@ def invariance_loss(
     same_b_acts: list[torch.Tensor],
     diff_a_acts: list[torch.Tensor],
     diff_b_acts: list[torch.Tensor],
+    device: str,
     space: str,  # "raw" or "sae"
     use_support_term: bool,
+    use_rank_term: bool,
+    use_bce_term: bool,
     bce_criterion: ScaledCosineBCELoss,
 ) -> tuple[torch.Tensor, dict]:
     """
@@ -110,15 +109,27 @@ def invariance_loss(
     else:
         raise ValueError(f"Unknown space: {space}")
 
-    # Compute Scaled Cosine BCE
-    total, attractive, repulsive = bce_criterion(same_a, same_b, diff_a, diff_b)
-    
+    # Calculate cosine similarities
+    sim_same = F.cosine_similarity(same_a, same_b)
+    sim_diff = F.cosine_similarity(diff_a, diff_b)
+
     components = dict(
-        attractive=attractive.item(), 
-        repulsive=repulsive.item(),
-        bce_loss=total.item()
+        attractive=sim_same.mean().item(), 
+        repulsive=sim_diff.mean().item()
     )
 
+    total = torch.tensor(0.0, device=device)
+
+    if use_bce_term:
+        # Compute Scaled Cosine BCE
+        bce_loss = bce_criterion(sim_same, sim_diff)
+        total = total + bce_loss
+        components["bce_loss"] = bce_loss.item()
+    
+    if use_rank_term:
+        rank_loss = (sim_diff[:, None] - sim_same[None, :]).mean()
+        total = total + rank_loss
+        components["rank_loss"] = rank_loss.item()
 
     if space == "sae" and use_support_term:
         support = soft_support_distance(same_a, same_b).mean()
