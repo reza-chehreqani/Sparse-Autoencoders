@@ -333,6 +333,8 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
                 loss_inv_sae = TRAIN_CONFIG["sae_recon_loss_weight"] * recon_loss + TRAIN_CONFIG["sparsity_loss_weight"] * sparsity_loss
                 inv_components["sae_recon_loss"] = recon_loss.item()
                 inv_components["sae_sparsity_loss"] = sparsity_loss.item()
+            else:
+                loss_inv_sae = torch.tensor(0.0)
 
             if sae_reg:
                 # Same reconstruction term as joint_sae's anchor, but the SAE
@@ -352,6 +354,8 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
                     recon_loss = recon_loss + saes[l].training_losses(all_acts)["reconstruction"]
                 loss_inv_sae = TRAIN_CONFIG["sae_recon_loss_weight"] * recon_loss
                 inv_components["sae_reg_recon_loss"] = recon_loss.item()
+            else:
+                loss_inv_sae = torch.tensor(0.0)
         else:
             loss_inv = torch.tensor(0.0)
             inv_components = {}
