@@ -94,7 +94,7 @@ MODEL_CONFIGS = {
 # If two or three adjacent layers are close, list all of them; the loss sums
 # over every layer listed.
 INVARIANCE_LAYERS = {
-    "gpt2-small": [6],           # placeholder
+    "gpt2-small": [8],           # placeholder
     "pythia-70m-deduped": [3],   # placeholder
     "gemma3-270m": [9],          # placeholder -- middle of the now-confirmed 18 layers
 }
