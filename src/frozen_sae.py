@@ -90,15 +90,66 @@ class FrozenSAE:
         loss and crushing the SAE's activity toward zero -- watch mean_l0()
         below alongside reconstruction_variance_explained() to check the
         weight is in a sane range, not just the loss value going down.
+
+        RECONSTRUCTION IS NORMALIZED PER TOKEN, NOT RAW MSE. This replaced a
+        plain torch.nn.functional.mse_loss(recon, acts) after the first full
+        Step-2 ablation on gpt2-small showed --sae_reg's reconstruction term
+        (train.py's loss_inv_sae / loss_lm_sae) making up 70-97% of
+        total_loss at lambda>=1, with the actual invariance loss essentially
+        flat/unoptimized as a result (confirmed by comparing C1_lm_only,
+        lambda=0, against C7_sae_bce_rank, lambda=10: their per-step
+        auroc_sae/cosine trajectories were statistically indistinguishable,
+        meaning the invariance loss wasn't the thing driving the model). Two
+        separate problems, both fixed by the same change:
+
+          1. Scale: raw MSE on GPT-2's residual stream (unnormalized, and
+             growing across layers) is 1-2 orders of magnitude larger than
+             the cosine-similarity-based invariance loss (bounded, ~O(1)).
+          2. Volatility: raw MSE sums squared error across every token,
+             including outliers -- GPT-2's first (BOS) token position is a
+             well-documented "attention sink" with anomalously large
+             residual-stream norm by the middle layers, so on a small batch
+             (batch_size_invariance=8 sentences) a single such token can
+             dominate the sum and swing the loss ~2 orders of magnitude
+             batch-to-batch (observed directly: loss_inv_sae ranged from 0.7
+             to 186.5 across steps of the same run).
+
+        Normalizing each token's squared error by that token's own squared
+        norm bounds every token's contribution to roughly O(1) regardless of
+        its absolute activation scale, so one outlier token no longer
+        dominates the batch, and the result is directly comparable in
+        magnitude to the invariance loss regardless of model/layer/depth.
+        This is also the standard "fraction of variance unexplained per
+        token" convention used in most SAE literature, rather than an ad hoc
+        choice.
+
+        NOTE: this changes the numeric scale of TRAIN_CONFIG's
+        sae_recon_loss_weight -- it needs to be re-tuned, not left at
+        whatever value worked against raw MSE. See config.py's comment on
+        that value, and use train.py's new gradnorm_* diagnostics (logged
+        alongside the loss components) to check the anchor's actual gradient
+        contribution against the invariance loss's, rather than eyeballing
+        loss magnitudes the way the old bug was originally missed.
         """
         if self._should_center:
             acts = acts - acts.mean(dim=-1, keepdim=True)
-            
+
         codes = self.encode(acts)
         recon = self.decode(codes)
-        reconstruction = torch.nn.functional.mse_loss(recon, acts)
+
+        per_token_sq_err = (recon - acts).pow(2).sum(dim=-1)
+        per_token_sq_norm = acts.pow(2).sum(dim=-1).clamp_min(1e-6)
+        reconstruction = (per_token_sq_err / per_token_sq_norm).mean()
+
         sparsity = codes.sum(dim=-1).mean()
-        return dict(reconstruction=reconstruction, sparsity=sparsity)
+        return dict(
+            reconstruction=reconstruction,
+            sparsity=sparsity,
+            # Unweighted, detached, logging-only -- lets training_log.json show
+            # the old-scale number too, for continuity when comparing against
+            # the first ablation's logs.
+            reconstruction_mse_raw=torch.nn.functional.mse_loss(recon, acts).detach(),
+        )
 
     @torch.no_grad()
     def mean_l0(self, acts: torch.Tensor) -> float:

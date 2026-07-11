@@ -76,6 +76,31 @@ from metrics import cosine_distance, discrimination_auroc
 from pairs_dataset import load_paws_split
 
 
+def _grad_norm(loss: torch.Tensor, params: list) -> float:
+    """L2 norm of the gradient `loss` would contribute to `params`, computed
+    without disturbing the real optimizer step below: retain_graph=True keeps
+    the graph alive for that later backward() call, and autograd.grad returns
+    gradients directly rather than accumulating into params[i].grad.
+
+    This is the actual diagnostic for "which loss term is driving training" --
+    loss *magnitude* is not a reliable proxy for gradient magnitude, since
+    different terms can have very different gradient scaling at the same
+    nominal loss value. This is precisely the diagnostic that would have
+    caught the raw-MSE-reconstruction-dominating-total_loss bug earlier: the
+    first full ablation's training_log.json had all the loss *values* right
+    there, but nothing showing what fraction of the actual parameter update
+    each one was responsible for.
+
+    Only call this periodically (see call site) -- each call is an extra
+    backward-shaped pass through the graph, not free.
+    """
+    if not isinstance(loss, torch.Tensor) or loss.grad_fn is None:
+        return 0.0
+    grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+    sq_sum = sum(g.pow(2).sum() for g in grads if g is not None)
+    return float(sq_sum.sqrt().item()) if isinstance(sq_sum, torch.Tensor) else 0.0
+
+
 def _paws_split_kwargs(split: str) -> dict:
     n_key = {
         "train": "n_train_pairs_per_condition",
@@ -248,6 +273,12 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
         param_groups.append(dict(params=sae_params, lr=TRAIN_CONFIG["sae_learning_rate"]))
     optimizer = torch.optim.AdamW(param_groups)
 
+    # For the periodic grad-norm diagnostic below -- LoRA params only (not the
+    # SAE's own params, even under --joint_sae): the question this answers is
+    # "how hard is each loss term pulling on the MODEL", which is what's
+    # actually at stake for representation drift/collapse.
+    trainable_model_params = [p for p in peft_model.parameters() if p.requires_grad]
+
     rng_state: dict = {}
     log = []
     for step in range(TRAIN_CONFIG["max_steps"]):
@@ -367,22 +398,41 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
             
         total_loss = loss_lm + loss_lm_sae + lam * (loss_inv + loss_inv_sae)
 
+        do_diag = step % TRAIN_CONFIG["eval_every"] == 0 or step == TRAIN_CONFIG["max_steps"] - 1
+        grad_diag = {}
+        if do_diag:
+            # Computed BEFORE zero_grad()/backward() below: each _grad_norm
+            # call uses retain_graph=True precisely so it doesn't consume the
+            # graph the real backward() still needs, and doesn't touch
+            # .grad on any param (autograd.grad returns gradients directly).
+            grad_diag = dict(
+                gradnorm_lm=_grad_norm(loss_lm, trainable_model_params),
+                gradnorm_lm_sae=_grad_norm(loss_lm_sae, trainable_model_params),
+                gradnorm_inv=_grad_norm(lam * loss_inv, trainable_model_params) if spec["use_invariance"] else 0.0,
+                gradnorm_inv_sae=_grad_norm(lam * loss_inv_sae, trainable_model_params) if spec["use_invariance"] else 0.0,
+            )
+
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
 
-        if step % TRAIN_CONFIG["eval_every"] == 0 or step == TRAIN_CONFIG["max_steps"] - 1:
+        if do_diag:
             checks = run_validation_checks(
                 peft_model, hf_model, tokenizer, saes, inv_layers, model_cfg.model_family, model_cfg.hook_side,
                 val_same, val_diff, wikitext_val_batcher, device,
             )
-            checks.update(step=step, loss_lm=float(loss_lm.item()), loss_lm_sae=float(loss_lm_sae.item()), loss_inv=float(loss_inv.item()), loss_inv_sae=float(loss_inv_sae.item()), total_loss=float(total_loss.item()), **inv_components)
+            checks.update(step=step, loss_lm=float(loss_lm.item()), loss_lm_sae=float(loss_lm_sae.item()), loss_inv=float(loss_inv.item()), loss_inv_sae=float(loss_inv_sae.item()), total_loss=float(total_loss.item()), **inv_components, **grad_diag)
             log.append(checks)
             print(
                 f"  step {step}: lm_loss={checks['loss_lm']:.3f} inv_loss={checks['loss_inv']:.4f} "
                 f"ppl={checks['perplexity']:.2f} auroc_sae={checks['auroc_sae']:.3f} "
                 f"same_cos={checks['mean_same_sae_cos']:.3f} diff_cos={checks['mean_diff_sae_cos']:.3f} "
                 f"sae_var_explained={checks['sae_variance_explained']:.3f} sae_mean_l0={checks['sae_mean_l0']:.1f}"
+            )
+            print(
+                f"    grad norms: lm={grad_diag['gradnorm_lm']:.4f}  lm_sae={grad_diag['gradnorm_lm_sae']:.4f}  "
+                f"inv={grad_diag['gradnorm_inv']:.4f}  inv_sae={grad_diag['gradnorm_inv_sae']:.4f}"
+                + ("  <-- inv_sae dominating inv, anchor still too strong" if grad_diag['gradnorm_inv_sae'] > 5 * max(grad_diag['gradnorm_inv'], 1e-8) else "")
             )
 
     run_id = f"{model_key}__{condition}__lam{lam}" #+ ("__jointsae" if joint_sae else "__saereg" if sae_reg else "")

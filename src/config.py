@@ -103,17 +103,17 @@ INVARIANCE_LAYERS = {
 # use_support_term: adds the soft-support (soft-Dice) term; only meaningful for space="sae".
 CONDITION_SPECS = {
     "C1_lm_only": dict(use_invariance=False, space=None, use_bce_term=False, use_rank_term=False, use_support_term=False),
-    "C2_raw_bce": dict(use_invariance=True,  space="raw", use_bce_term=True, use_rank_term=False, use_support_term=False),
+    # "C2_raw_bce": dict(use_invariance=True,  space="raw", use_bce_term=True, use_rank_term=False, use_support_term=False),
     # "C3_raw_rank": dict(use_invariance=True,  space="raw", use_bce_term=False, use_rank_term=True, use_support_term=False),
     # "C4_raw_bce_rank": dict(use_invariance=True,  space="raw", use_bce_term=True, use_rank_term=True, use_support_term=False),
     "C5_sae_bce": dict(use_invariance=True,  space="sae", use_bce_term=True, use_rank_term=False, use_support_term=False),
     # "C6_sae_rank": dict(use_invariance=True,  space="sae", use_bce_term=False, use_rank_term=True, use_support_term=False),
     # "C7_sae_bce_rank": dict(use_invariance=True,  space="sae", use_bce_term=True, use_rank_term=True, use_support_term=False),
-    "C8_sae_bce_support": dict(use_invariance=True,  space="sae", use_bce_term=True, use_rank_term=False, use_support_term=True),
+    # "C8_sae_bce_support": dict(use_invariance=True,  space="sae", use_bce_term=True, use_rank_term=False, use_support_term=True),
     # "C9_sae_rank_support": dict(use_invariance=True,  space="sae", use_bce_term=False, use_rank_term=True, use_support_term=True),
 }
 
-LAMBDA_GRID = [0.1, 0.5, 1.0, 2.0, 3.0, 10.0]  # swept for C2-C4; C1 has no invariance term (lambda ignored)
+LAMBDA_GRID = [10.0]  # swept for C2-C4; C1 has no invariance term (lambda ignored)
 
 PAWS_CONFIG = dict(
     hf_name="google-research-datasets/paws",
@@ -143,11 +143,29 @@ TRAIN_CONFIG = dict(
     sae_learning_rate=1e-5,      # only used with --joint_sae; deliberately much smaller than
                                    # learning_rate, since the SAE dictionary is already converged
                                    # and this is a gentle continuation, not training from scratch
-    sae_recon_loss_weight=1.0,    # only used with --joint_sae; weight on the SAE's own
-                                    # reconstruction-MSE anchor term (frozen_sae.FrozenSAE.
-                                    # reconstruction_loss) relative to the rest of the total loss --
-                                    # this is what stops the SAE from collapsing to a trivial,
-                                    # input-independent encoding under the invariance loss alone
+    sae_recon_loss_weight=50.0,   # RECALIBRATED, NOT YET EMPIRICALLY VERIFIED. frozen_sae.
+                                    # FrozenSAE.training_losses' reconstruction term changed from
+                                    # raw MSE to a per-token normalized (relative) error -- see
+                                    # that docstring: raw MSE was found to be 70-97% of
+                                    # total_loss at lambda>=1 in the first full gpt2-small
+                                    # ablation, with the actual invariance loss essentially
+                                    # unoptimized as a result (C1_lm_only and C7_sae_bce_rank
+                                    # lambda=10 produced statistically indistinguishable
+                                    # per-step AUROC trajectories -- direct evidence the
+                                    # invariance term wasn't driving the model at all). The
+                                    # normalized version is O(0.01-0.1) for a well-fit SAE
+                                    # instead of raw MSE's O(1-100+), so the old weight (1.0)
+                                    # is now almost certainly too small rather than too large --
+                                    # 50.0 here is a rough starting guess, not a tuned value.
+                                    #
+                                    # DO NOT trust this number -- after a short run, check
+                                    # train.py's new gradnorm_lm / gradnorm_inv / gradnorm_inv_sae
+                                    # fields in training_log.json (also printed live as "grad
+                                    # norms: ..."). gradnorm_inv_sae should be roughly the same
+                                    # order of magnitude as gradnorm_inv, not 5-10x+ it (the
+                                    # console print flags this automatically), and it should stay
+                                    # stable across steps rather than spiking. Adjust this weight
+                                    # and re-check rather than assuming 50.0 is correct.
     sparsity_loss_weight=1e-4,     # only used with --joint_sae; weight on the SAE's L1 sparsity
                                      # term (frozen_sae.FrozenSAE.training_losses). Deliberately
                                      # small and approximate -- raw L1 magnitude scales with
