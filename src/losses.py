@@ -41,6 +41,11 @@ import torch
 
 from metrics import cosine_similarity, normalized_l2
 
+import torch.nn.functional as F
+
+def pairwise_hinge_rank_loss(sim_same, sim_diff, margin):
+    diff_b, same_b = torch.broadcast_tensors(sim_diff[:, None], sim_same[None, :])
+    return F.relu(margin - (same_b - diff_b)).mean()
 
 def lm_loss(model, input_ids: torch.Tensor) -> torch.Tensor:
     outputs = model(input_ids=input_ids, labels=input_ids)
@@ -104,7 +109,7 @@ def invariance_loss(
 
     attractive = cosine_similarity(same_a, same_b)#.mean() #+ normalized_l2(same_a, same_b).mean()
     repulsive = cosine_similarity(diff_a, diff_b)#.mean()
-    total = (repulsive[:, None] - attractive[None, :]).mean()
+    total = pairwise_hinge_rank_loss(attractive, repulsive, 0.5)
     components = dict(attractive=attractive.mean().item(), repulsive=repulsive.mean().item())
 
     if space == "sae" and use_support_term:
