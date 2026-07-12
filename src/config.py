@@ -94,7 +94,7 @@ MODEL_CONFIGS = {
 # If two or three adjacent layers are close, list all of them; the loss sums
 # over every layer listed.
 INVARIANCE_LAYERS = {
-    "gpt2-small": [6],           # placeholder
+    "gpt2-small": [7],           # placeholder
     "pythia-70m-deduped": [3],   # placeholder
     "gemma3-270m": [9],          # placeholder -- middle of the now-confirmed 18 layers
 }
@@ -108,7 +108,7 @@ CONDITION_SPECS = {
     "C4_sae_magnitude_support": dict(use_invariance=True,  space="sae", use_support_term=True),
 }
 
-LAMBDA_GRID = [0.1, 1.0, 3.0, 10.0]  # swept for C2-C4; C1 has no invariance term (lambda ignored)
+LAMBDA_GRID = [0.01, 0.03, 0.1, 0.3, 1.0]  # swept for C2-C4; C1 has no invariance term (lambda ignored)
 
 PAWS_CONFIG = dict(
     hf_name="google-research-datasets/paws",
