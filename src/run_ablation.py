@@ -44,20 +44,29 @@ def ensure_baseline_evaluated(model_key: str) -> None:
     subprocess.run([sys.executable, "evaluate.py", "--model", model_key, "--run_id", "baseline"], check=True)
 
 
-def summarize(run_ids: list[str], model_key: str, invariance_layer: int) -> None:
+def summarize(run_ids: list[str], model_key: str, invariance_layers: list[int]) -> None:
+    def avg_auroc(stats: dict[int, dict]) -> float | None:
+        values = [stats[l]["auroc_sae"] for l in invariance_layers if l in stats]
+        return sum(values) / len(values) if values else None
+
     print(f"\n{'run_id':<45}{'AUROC_sae(test)':<18}{'delta_vs_baseline':<20}")
     with open(os.path.join(TRAIN_CONFIG["output_dir"], "baseline", "eval", f"{model_key}_layer_stats.json")) as f:
         baseline_stats = {s["layer"]: s for s in json.load(f)}
-    baseline_auroc = baseline_stats[invariance_layer]["auroc_sae"]
+    baseline_auroc = avg_auroc(baseline_stats)
+    if baseline_auroc is None:
+        print(f"none of layers {invariance_layers} found in baseline eval for {model_key}")
+        return
     print(f"{'baseline':<45}{baseline_auroc:<18.3f}{'--':<20}")
 
     for run_id in run_ids:
         path = os.path.join(TRAIN_CONFIG["output_dir"], run_id, "eval", f"{model_key}_layer_stats.json")
         with open(path) as f:
             stats = {s["layer"]: s for s in json.load(f)}
-        auroc = stats[invariance_layer]["auroc_sae"]
+        auroc = avg_auroc(stats)
+        if auroc is None:
+            print(f"{run_id:<45}{'n/a':<18}{'n/a':<20}")
+            continue
         print(f"{run_id:<45}{auroc:<18.3f}{auroc - baseline_auroc:<+20.3f}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -90,4 +99,4 @@ if __name__ == "__main__":
             else:
                 for lam in lambdas:
                     run_ids.append(run_one(model_key, condition, lam, joint_sae_here))
-        summarize(run_ids, model_key, INVARIANCE_LAYERS[model_key][0])
+        summarize(run_ids, model_key, INVARIANCE_LAYERS[model_key])
