@@ -94,21 +94,21 @@ MODEL_CONFIGS = {
 # If two or three adjacent layers are close, list all of them; the loss sums
 # over every layer listed.
 INVARIANCE_LAYERS = {
-    "gpt2-small": [6],           # placeholder
-    "pythia-70m-deduped": [3],   # placeholder
+    "gpt2-small": [3, 4, 5],           # placeholder
+    "pythia-70m-deduped": [2, 3, 4],   # placeholder
     "gemma3-270m": [9],          # placeholder -- middle of the now-confirmed 18 layers
 }
 
 # space: "raw" or "sae" -- which representation the magnitude term is computed on.
 # use_support_term: adds the soft-support (soft-Dice) term; only meaningful for space="sae".
 CONDITION_SPECS = {
-    # "C1_lm_only":               dict(use_invariance=False, space=None,  use_support_term=False),
+    "C1_lm_only":               dict(use_invariance=False, space=None,  use_support_term=False),
     "C2_raw_invariance":        dict(use_invariance=True,  space="raw", use_support_term=False),
     "C3_sae_magnitude":         dict(use_invariance=True,  space="sae", use_support_term=False),
     "C4_sae_magnitude_support": dict(use_invariance=True,  space="sae", use_support_term=True),
 }
 
-LAMBDA_GRID = [0.01, 0.03, 0.3]  # swept for C2-C4; C1 has no invariance term (lambda ignored)
+LAMBDA_GRID = [0.03, 0.1, 0.3, 1.0, 3.0] # swept for C2-C4; C1 has no invariance term (lambda ignored)
 
 PAWS_CONFIG = dict(
     hf_name="google-research-datasets/paws",
