@@ -143,7 +143,7 @@ TRAIN_CONFIG = dict(
     sae_learning_rate=1e-5,      # only used with --joint_sae; deliberately much smaller than
                                    # learning_rate, since the SAE dictionary is already converged
                                    # and this is a gentle continuation, not training from scratch
-    sae_recon_loss_weight=50.0,   # Pairs with the fix in train.py: total_loss now adds
+    sae_recon_loss_weight=5.0,   # Pairs with the fix in train.py: total_loss now adds
                                     # loss_inv_sae UNSCALED by lambda (`... + lam*loss_inv +
                                     # loss_inv_sae`, not `lam*(loss_inv+loss_inv_sae)`). This
                                     # value is no longer a guess -- it's grounded in a direct
