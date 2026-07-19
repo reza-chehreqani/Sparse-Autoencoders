@@ -446,6 +446,18 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
 
         optimizer.zero_grad()
         total_loss.backward()
+        # Defense-in-depth, not a substitute for fixing loss-level bugs (see
+        # frozen_sae.FrozenSAE.training_losses' docstring for the actual root
+        # cause found and fixed this round). Nothing in this file bounded a
+        # single step's parameter update before this -- a pathological batch
+        # or a loss-normalization edge case (as just happened) had a direct,
+        # uncushioned path to the model weights. This clips the TOTAL gradient
+        # norm across every trainable param (LoRA + SAE if --joint_sae) after
+        # all loss terms are already summed and backpropagated, so it's a
+        # single, simple guardrail regardless of which term misbehaves next,
+        # rather than something to tune per loss term.
+        clip_params = trainable_model_params + (sae_params if joint_sae else [])
+        torch.nn.utils.clip_grad_norm_(clip_params, TRAIN_CONFIG["grad_clip_norm"])
         optimizer.step()
 
         if do_diag:

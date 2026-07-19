@@ -91,37 +91,51 @@ class FrozenSAE:
         below alongside reconstruction_variance_explained() to check the
         weight is in a sane range, not just the loss value going down.
 
-        RECONSTRUCTION IS NORMALIZED PER TOKEN, NOT RAW MSE. This replaced a
-        plain torch.nn.functional.mse_loss(recon, acts) after the first full
-        Step-2 ablation on gpt2-small showed --sae_reg's reconstruction term
-        (train.py's loss_inv_sae / loss_lm_sae) making up 70-97% of
-        total_loss at lambda>=1, with the actual invariance loss essentially
-        flat/unoptimized as a result (confirmed by comparing C1_lm_only,
-        lambda=0, against C7_sae_bce_rank, lambda=10: their per-step
-        auroc_sae/cosine trajectories were statistically indistinguishable,
-        meaning the invariance loss wasn't the thing driving the model). Two
-        separate problems, both fixed by the same change:
+        RECONSTRUCTION IS AN AGGREGATE (SUM/SUM) RATIO, NOT A PER-TOKEN
+        AVERAGE. This replaced a plain torch.nn.functional.mse_loss(recon,
+        acts) after the first full Step-2 ablation on gpt2-small showed
+        --sae_reg's reconstruction term (train.py's loss_inv_sae /
+        loss_lm_sae) making up 70-97% of total_loss at lambda>=1, with the
+        actual invariance loss essentially flat/unoptimized as a result. That
+        first fix computed a PER-TOKEN ratio and averaged the ratios:
 
-          1. Scale: raw MSE on GPT-2's residual stream (unnormalized, and
-             growing across layers) is 1-2 orders of magnitude larger than
-             the cosine-similarity-based invariance loss (bounded, ~O(1)).
-          2. Volatility: raw MSE sums squared error across every token,
-             including outliers -- GPT-2's first (BOS) token position is a
-             well-documented "attention sink" with anomalously large
-             residual-stream norm by the middle layers, so on a small batch
-             (batch_size_invariance=8 sentences) a single such token can
-             dominate the sum and swing the loss ~2 orders of magnitude
-             batch-to-batch (observed directly: loss_inv_sae ranged from 0.7
-             to 186.5 across steps of the same run).
+            per_token_sq_err / per_token_sq_norm.clamp_min(1e-6), then .mean()
 
-        Normalizing each token's squared error by that token's own squared
-        norm bounds every token's contribution to roughly O(1) regardless of
-        its absolute activation scale, so one outlier token no longer
-        dominates the batch, and the result is directly comparable in
-        magnitude to the invariance loss regardless of model/layer/depth.
-        This is also the standard "fraction of variance unexplained per
-        token" convention used in most SAE literature, rather than an ad hoc
-        choice.
+        which fixed the original scale/volatility problem but introduced a
+        new, worse one: user-run diagnostics (a clean A/B -- identical model,
+        seed, WikiText batch order, and lambda=0 for C1_lm_only, differing
+        ONLY in --sae_reg) isolated a step-50 perplexity spike to 100M+ that
+        occurred ONLY when --sae_reg was on, never otherwise, on an otherwise
+        completely deterministic WikiText batch order. Mechanism: if even one
+        token in a batch has a near-zero activation norm at the invariance
+        layer, clamp_min(1e-6) does not stop per_token_sq_err /
+        per_token_sq_norm from being enormous for that one token -- and
+        because the old formula AVERAGES ratios rather than summing before
+        dividing, one such token is a lone, unbounded term inside a mean, not
+        a term that gets diluted by the batch. Weighted by
+        sae_recon_loss_weight=50 and backpropagated with no gradient clipping
+        anywhere in train.py (added below, but this fix removes the root
+        cause rather than just cushioning it), that one token was enough to
+        wreck the model for a step (observed directly: lm_loss went from
+        11.568 at init to 12.684 -- WORSE than initialization -- at the exact
+        step this fired, while an identical run without --sae_reg had already
+        dropped to 5.955 on the same data).
+
+        The aggregate form below computes ONE ratio for the whole batch --
+        sum of squared errors over sum of squared norms -- instead of
+        averaging per-token ratios. A single near-zero-norm token now barely
+        moves either sum, rather than standing alone as an unbounded
+        division. This is the same "fraction of activation energy left
+        unreconstructed" quantity as the reconstruction_variance_explained()
+        diagnostic already uses below, just applied inside the loss itself
+        instead of only for logging -- and it's still the same order of
+        magnitude fix relative to raw MSE that motivated normalizing in the
+        first place (comparable scale to the invariance loss, not swamping
+        it), without the per-token-average's fragility to any single outlier.
+        The explicit .clamp(max=...) below is deliberate defense-in-depth on
+        top of the structural fix, not a substitute for it -- it bounds the
+        worst case if some future SAE/activation combination still produces
+        a pathological ratio for a reason this fix doesn't anticipate.
 
         NOTE: this changes the numeric scale of TRAIN_CONFIG's
         sae_recon_loss_weight -- it needs to be re-tuned, not left at
@@ -138,8 +152,18 @@ class FrozenSAE:
         recon = self.decode(codes)
 
         per_token_sq_err = (recon - acts).pow(2).sum(dim=-1)
-        per_token_sq_norm = acts.pow(2).sum(dim=-1).clamp_min(1e-6)
-        reconstruction = (per_token_sq_err / per_token_sq_norm).mean()
+        per_token_sq_norm = acts.pow(2).sum(dim=-1)
+
+        # Aggregate BEFORE dividing -- see docstring above for why this,
+        # rather than per_token_sq_err/per_token_sq_norm-then-.mean(), is what
+        # actually fixes the near-zero-denominator instability, not just
+        # relocates it.
+        reconstruction = per_token_sq_err.sum() / per_token_sq_norm.sum().clamp_min(1e-6)
+        # Defense-in-depth, not the primary fix: bounds the worst case even if
+        # something else unexpected produces a large aggregate ratio (e.g. an
+        # entire batch of degenerate activations, which the sum/sum form alone
+        # wouldn't protect against the way it protects against a single token).
+        reconstruction = reconstruction.clamp(max=10.0)
 
         sparsity = codes.sum(dim=-1).mean()
         return dict(

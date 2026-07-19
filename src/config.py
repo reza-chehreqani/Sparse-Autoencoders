@@ -143,7 +143,7 @@ TRAIN_CONFIG = dict(
     sae_learning_rate=1e-5,      # only used with --joint_sae; deliberately much smaller than
                                    # learning_rate, since the SAE dictionary is already converged
                                    # and this is a gentle continuation, not training from scratch
-    sae_recon_loss_weight=1.0,   # Pairs with the fix in train.py: total_loss now adds
+    sae_recon_loss_weight=50.0,   # Pairs with the fix in train.py: total_loss now adds
                                     # loss_inv_sae UNSCALED by lambda (`... + lam*loss_inv +
                                     # loss_inv_sae`, not `lam*(loss_inv+loss_inv_sae)`). This
                                     # value is no longer a guess -- it's grounded in a direct
@@ -202,6 +202,26 @@ TRAIN_CONFIG = dict(
                                 # hooked_activations.py), not padded into a single batched call
     max_steps=500,               # deliberately short -- see README on SAE-drift risk
     eval_every=50,
+    grad_clip_norm=1.0,  # torch.nn.utils.clip_grad_norm_ applied to every trainable param
+                           # right before optimizer.step(), across all loss terms combined.
+                           # Added after a user-run A/B (C1_lm_only, lambda=0, identical
+                           # seed/WikiText batch order, differing only in --sae_reg) isolated
+                           # a step-50 perplexity spike to 100M+ that occurred ONLY with
+                           # --sae_reg on -- traced to frozen_sae.FrozenSAE.training_losses'
+                           # reconstruction term producing an unboundedly large ratio for a
+                           # single near-zero-norm WikiText token, with nothing anywhere in
+                           # train.py stopping that from reaching the model weights in one
+                           # uncushioned step. That specific bug is now fixed at the loss
+                           # level (aggregate sum/sum ratio instead of an averaged per-token
+                           # ratio, plus an explicit output cap -- see that docstring), so this
+                           # shouldn't need to fire under normal conditions; it's here as a
+                           # general guardrail against whatever the next unanticipated edge
+                           # case turns out to be, not a replacement for finding and fixing
+                           # the actual cause when one shows up. 1.0 is a conventional default
+                           # for LoRA-scale fine-tuning, not something tuned specifically for
+                           # this project -- if it turns out to bind frequently during normal
+                           # (non-pathological) training, that's worth a second look rather
+                           # than silently raising it.
     sae_fidelity_warn_threshold=0.9,  # train.py prints a warning at any eval_every checkpoint
                                         # where sae_variance_explained falls below this -- the
                                         # frozen SAE no longer fits the checkpoint's activations
