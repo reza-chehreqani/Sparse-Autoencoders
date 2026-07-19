@@ -20,11 +20,12 @@ from metrics import cosine_distance, normalized_l2
 
 
 class ScaledCosineBCELoss(nn.Module):
-    def __init__(self, initial_scale=10.0, initial_bias=0.0):
+    def __init__(self, initial_scale=10.0, initial_bias=0.0, max_scale=50.0):
         super().__init__()
         # Learnable parameters for dynamic margin scaling
         self.scale = nn.Parameter(torch.tensor([initial_scale]))
         self.bias = nn.Parameter(torch.tensor([initial_bias]))
+        self.max_scale = max_scale
         self.bce = nn.BCEWithLogitsLoss()
 
     def forward(self, sim_same, sim_diff):
@@ -37,8 +38,23 @@ class ScaledCosineBCELoss(nn.Module):
             torch.zeros_like(sim_diff)
         ], dim=0)
         
-        # Scale and shift to create logits
-        logits = sims * self.scale + self.bias
+        # Scale and shift to create logits. scale is clamped, not used raw: an
+        # unconstrained learnable scale on a bounded cosine similarity has a
+        # trivial way to shrink BCE loss that has nothing to do with the model
+        # actually separating same/diff pairs any further -- just keep growing
+        # the scale, which sharpens the sigmoid around whatever separation
+        # already exists. That inflates the gradient this loss sends back into
+        # the model (observed directly: gradnorm_inv grew past 1000 by the end
+        # of the least stable gpt2-small/pythia-70m-deduped sae_reg run) without
+        # the underlying representations needing to change at all. Clamping
+        # bounds how much "free" loss reduction the scale alone can buy;
+        # min=1.0 keeps a degenerate near-zero scale (which would flatten the
+        # loss's gradient w.r.t. the model to ~0, the opposite failure mode)
+        # off the table too. Gradient is exactly zero for the raw parameter
+        # once it's pushed past either bound, so it self-limits rather than
+        # needing a separate check elsewhere.
+        scale = self.scale.clamp(min=1.0, max=self.max_scale)
+        logits = sims * scale + self.bias
         
         # Calculate BCE
         loss = self.bce(logits, labels)
@@ -77,9 +93,6 @@ def soft_support_distance(z_a: torch.Tensor, z_b: torch.Tensor, eps: float = 1e-
     soft_dice = (2 * intersection + eps) / (total + eps)
     return 1.0 - soft_dice
 
-def pairwise_hinge_rank_loss(sim_same, sim_diff, margin=0.5):
-    diff_b, same_b = torch.broadcast_tensors(sim_diff[:, None], sim_same[None, :])
-    return F.relu(margin - (same_b - diff_b)).mean()
 
 def invariance_loss(
     sae,
@@ -130,7 +143,7 @@ def invariance_loss(
         components["bce_loss"] = bce_loss.item()
     
     if use_rank_term:
-        rank_loss = pairwise_hinge_rank_loss(sim_same, sim_diff)
+        rank_loss = (sim_diff[:, None] - sim_same[None, :]).mean()
         total = total + rank_loss
         components["rank_loss"] = rank_loss.item()
 

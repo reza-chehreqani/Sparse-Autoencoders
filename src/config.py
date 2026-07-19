@@ -143,29 +143,45 @@ TRAIN_CONFIG = dict(
     sae_learning_rate=1e-5,      # only used with --joint_sae; deliberately much smaller than
                                    # learning_rate, since the SAE dictionary is already converged
                                    # and this is a gentle continuation, not training from scratch
-    sae_recon_loss_weight=1.0,   # RECALIBRATED, NOT YET EMPIRICALLY VERIFIED. frozen_sae.
-                                    # FrozenSAE.training_losses' reconstruction term changed from
-                                    # raw MSE to a per-token normalized (relative) error -- see
-                                    # that docstring: raw MSE was found to be 70-97% of
-                                    # total_loss at lambda>=1 in the first full gpt2-small
-                                    # ablation, with the actual invariance loss essentially
-                                    # unoptimized as a result (C1_lm_only and C7_sae_bce_rank
-                                    # lambda=10 produced statistically indistinguishable
-                                    # per-step AUROC trajectories -- direct evidence the
-                                    # invariance term wasn't driving the model at all). The
-                                    # normalized version is O(0.01-0.1) for a well-fit SAE
-                                    # instead of raw MSE's O(1-100+), so the old weight (1.0)
-                                    # is now almost certainly too small rather than too large --
-                                    # 50.0 here is a rough starting guess, not a tuned value.
+    sae_recon_loss_weight=50.0,   # Pairs with the fix in train.py: total_loss now adds
+                                    # loss_inv_sae UNSCALED by lambda (`... + lam*loss_inv +
+                                    # loss_inv_sae`, not `lam*(loss_inv+loss_inv_sae)`). This
+                                    # value is no longer a guess -- it's grounded in a direct
+                                    # A/B inside the actual training logs: loss_lm_sae uses this
+                                    # same weight=50 and is NEVER lambda-scaled, and its gradient
+                                    # settled to a ~1-2x ratio against loss_lm's own gradient
+                                    # within ~50 steps (median 1.7x across a full run). Before
+                                    # this fix, loss_inv_sae used the same weight=50 but WAS
+                                    # lambda-scaled, and at lambda=10 that produced a ~500x
+                                    # effective multiplier -- median gradient ratio ~17x, mean
+                                    # ~24x, over loss_inv for the entire run, which is why the
+                                    # invariance loss barely moved. Same weight, same normalized
+                                    # loss, only the lambda multiplier differed -- removing it
+                                    # (the train.py fix) should let loss_inv_sae behave like
+                                    # loss_lm_sae already does. Still worth checking
+                                    # gradnorm_inv / gradnorm_inv_sae in a real run rather than
+                                    # assuming this transfers exactly -- the PAWS batch's
+                                    # activation statistics aren't identical to WikiText's.
                                     #
-                                    # DO NOT trust this number -- after a short run, check
-                                    # train.py's new gradnorm_lm / gradnorm_inv / gradnorm_inv_sae
-                                    # fields in training_log.json (also printed live as "grad
-                                    # norms: ..."). gradnorm_inv_sae should be roughly the same
-                                    # order of magnitude as gradnorm_inv, not 5-10x+ it (the
-                                    # console print flags this automatically), and it should stay
-                                    # stable across steps rather than spiking. Adjust this weight
-                                    # and re-check rather than assuming 50.0 is correct.
+                                    # NOTE: an earlier attempt fixed this problem a different way
+                                    # -- dropping this weight to 1.0 while LEAVING the lambda
+                                    # scaling in place. That resolved the domination at high
+                                    # lambda but overshot in the opposite direction: at lambda=10
+                                    # the anchor became too weak to hold the model in the frozen
+                                    # SAE's reconstructable region at all. Confirmed on both
+                                    # models: sae_variance_explained fell from ~0.97-0.998 at
+                                    # init to as low as 0.63 (pythia-70m-deduped) and even
+                                    # negative (gpt2-small, meaning the SAE reconstructed worse
+                                    # than predicting the mean) by the end of training, and the
+                                    # AUROC gains that run produced correlated strongly with that
+                                    # collapse (r=-0.83 across the pythia-70m-deduped grid) rather
+                                    # than with anything specific to the invariance loss --
+                                    # i.e. likely an artifact of measuring through an
+                                    # increasingly mismatched SAE, not genuine representational
+                                    # invariance. Don't re-introduce lambda-scaling on this term
+                                    # without re-checking sae_variance_explained across the whole
+                                    # lambda range, not just gradnorm ratios -- gradnorm alone
+                                    # didn't catch this failure mode.
     sparsity_loss_weight=1e-4,     # only used with --joint_sae; weight on the SAE's L1 sparsity
                                      # term (frozen_sae.FrozenSAE.training_losses). Deliberately
                                      # small and approximate -- raw L1 magnitude scales with
@@ -186,6 +202,17 @@ TRAIN_CONFIG = dict(
                                 # hooked_activations.py), not padded into a single batched call
     max_steps=500,               # deliberately short -- see README on SAE-drift risk
     eval_every=50,
+    sae_fidelity_warn_threshold=0.9,  # train.py prints a warning at any eval_every checkpoint
+                                        # where sae_variance_explained falls below this -- the
+                                        # frozen SAE no longer fits the checkpoint's activations
+                                        # well at that point, and auroc_sae from there on may
+                                        # reflect a mismatched measuring instrument rather than
+                                        # genuine representational change. 0.9 is a starting
+                                        # point, not a validated cutoff -- baseline sits at
+                                        # ~0.97-0.998 on both models tried so far, so this still
+                                        # leaves meaningful room before flagging; tighten it if
+                                        # that turns out too permissive once you have more runs
+                                        # to compare against.
     support_threshold=0.0,
     eval_batch_size=32,           # padded batch size for evaluate.py's forward passes;
                                     # unrelated to batch_size_lm/batch_size_invariance above,

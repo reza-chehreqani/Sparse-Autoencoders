@@ -413,6 +413,17 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
             loss_inv_sae = torch.tensor(0.0)
             
         total_loss = loss_lm + loss_lm_sae + lam * loss_inv + loss_inv_sae
+        # NOT `lam * (loss_inv + loss_inv_sae)` -- see the second sanity-check run
+        # (gpt2-small, C1_lm_only vs C5_sae_bce lam=10): with the SAME weight=50,
+        # the WikiText-side anchor (loss_lm_sae, never lambda-scaled) settled to a
+        # ~1-2x gradient ratio against loss_lm almost immediately, while the
+        # PAWS-side anchor (loss_inv_sae, previously lambda-scaled) stayed
+        # 5-100x (median ~17x, mean ~24x) over loss_inv for the entire run at
+        # lam=10 -- same weight, same underlying normalized loss, the only
+        # difference was the `lam *` multiplier compounding weight=50 up to an
+        # effective 500x. Removing that multiplier here restores the ~1-2x
+        # balance the WikiText side already demonstrates works, without
+        # needing a second, separately-tuned weight constant for the PAWS side.
 
         do_diag = step % TRAIN_CONFIG["eval_every"] == 0 or step == TRAIN_CONFIG["max_steps"] - 1
         grad_diag = {}
@@ -425,7 +436,12 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
                 gradnorm_lm=_grad_norm(loss_lm, trainable_model_params),
                 gradnorm_lm_sae=_grad_norm(loss_lm_sae, trainable_model_params),
                 gradnorm_inv=_grad_norm(lam * loss_inv, trainable_model_params) if spec["use_invariance"] else 0.0,
-                gradnorm_inv_sae=_grad_norm(lam * loss_inv_sae, trainable_model_params) if spec["use_invariance"] else 0.0,
+                # No `lam *` here -- matches total_loss above. This diagnostic
+                # reports the gradient each term actually contributes; if it
+                # scaled loss_inv_sae by lam while total_loss doesn't, the
+                # printed ratio would silently stop meaning what its warning
+                # message says it means.
+                gradnorm_inv_sae=_grad_norm(loss_inv_sae, trainable_model_params) if spec["use_invariance"] else 0.0,
             )
 
         optimizer.zero_grad()
@@ -437,19 +453,35 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
                 peft_model, hf_model, tokenizer, saes, inv_layers, model_cfg.model_family, model_cfg.hook_side,
                 val_same, val_diff, wikitext_val_batcher, device,
             )
-            checks.update(step=step, loss_lm=float(loss_lm.item()), loss_lm_sae=float(loss_lm_sae.item()), loss_inv=float(loss_inv.item()), loss_inv_sae=float(loss_inv_sae.item()), total_loss=float(total_loss.item()), **inv_components, **grad_diag)
+            # bce_scale is the RAW (unclamped) parameter value -- deliberately
+            # not the clamped value actually used in the loss (see losses.py).
+            # Logging the raw value shows whether the optimizer is still
+            # pushing against the clamp ceiling/floor, which the clamped value
+            # alone would hide (it would just read back max_scale forever).
+            bce_scale = float(bce_criterion.scale.item()) if spec["use_bce_term"] else None
+            checks.update(step=step, loss_lm=float(loss_lm.item()), loss_lm_sae=float(loss_lm_sae.item()), loss_inv=float(loss_inv.item()), loss_inv_sae=float(loss_inv_sae.item()), total_loss=float(total_loss.item()), bce_scale=bce_scale, **inv_components, **grad_diag)
             log.append(checks)
             print(
                 f"  step {step}: lm_loss={checks['loss_lm']:.3f} inv_loss={checks['loss_inv']:.4f} "
                 f"ppl={checks['perplexity']:.2f} auroc_sae={checks['auroc_sae']:.3f} "
                 f"same_cos={checks['mean_same_sae_cos']:.3f} diff_cos={checks['mean_diff_sae_cos']:.3f} "
                 f"sae_var_explained={checks['sae_variance_explained']:.3f} sae_mean_l0={checks['sae_mean_l0']:.1f}"
+                + (f" bce_scale={bce_scale:.2f}" if bce_scale is not None else "")
             )
             print(
                 f"    grad norms: lm={grad_diag['gradnorm_lm']:.4f}  lm_sae={grad_diag['gradnorm_lm_sae']:.4f}  "
                 f"inv={grad_diag['gradnorm_inv']:.4f}  inv_sae={grad_diag['gradnorm_inv_sae']:.4f}"
                 + ("  <-- inv_sae dominating inv, anchor still too strong" if grad_diag['gradnorm_inv_sae'] > 5 * max(grad_diag['gradnorm_inv'], 1e-8) else "")
             )
+            if checks["sae_variance_explained"] < TRAIN_CONFIG["sae_fidelity_warn_threshold"]:
+                print(
+                    f"    !! SAE FIDELITY WARNING: sae_variance_explained={checks['sae_variance_explained']:.3f} "
+                    f"is below {TRAIN_CONFIG['sae_fidelity_warn_threshold']} -- the frozen SAE no longer fits this "
+                    f"checkpoint's activations well. auroc_sae from here on may reflect a mismatched measuring "
+                    f"instrument rather than genuine representational change (see frozen_sae.FrozenSAE."
+                    f"reconstruction_variance_explained's docstring). Treat this run's eval numbers with caution."
+                )
+
 
     run_id = f"{model_key}__{condition}__lam{lam}" #+ ("__jointsae" if joint_sae else "__saereg" if sae_reg else "")
     out_dir = os.path.join(TRAIN_CONFIG["output_dir"], run_id)
