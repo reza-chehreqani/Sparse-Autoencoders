@@ -143,7 +143,7 @@ TRAIN_CONFIG = dict(
     sae_learning_rate=1e-5,      # only used with --joint_sae; deliberately much smaller than
                                    # learning_rate, since the SAE dictionary is already converged
                                    # and this is a gentle continuation, not training from scratch
-    sae_recon_loss_weight=10.0,   # RECALIBRATED, NOT YET EMPIRICALLY VERIFIED. frozen_sae.
+    sae_recon_loss_weight=1.0,   # RECALIBRATED, NOT YET EMPIRICALLY VERIFIED. frozen_sae.
                                     # FrozenSAE.training_losses' reconstruction term changed from
                                     # raw MSE to a per-token normalized (relative) error -- see
                                     # that docstring: raw MSE was found to be 70-97% of
