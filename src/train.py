@@ -412,7 +412,7 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
             inv_components = {}
             loss_inv_sae = torch.tensor(0.0)
             
-        total_loss = loss_lm + loss_lm_sae + lam * (loss_inv + loss_inv_sae)
+        total_loss = loss_lm + loss_lm_sae + lam * loss_inv + loss_inv_sae
 
         do_diag = step % TRAIN_CONFIG["eval_every"] == 0 or step == TRAIN_CONFIG["max_steps"] - 1
         grad_diag = {}
