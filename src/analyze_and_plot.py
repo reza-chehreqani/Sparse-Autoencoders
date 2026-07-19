@@ -12,18 +12,23 @@ Produces, under results/step2_llm/analysis/:
   - <model>__ablation_auroc_vs_lambda.png   test-set AUROC (SAE space) vs. lambda,
                                              one line per condition, with baseline
                                              and C1 as reference lines -- this is
-                                             the main decision-gate plot.
-  - <model>__perplexity_tradeoff.png   delta-AUROC-vs-baseline against final
+                                             the main decision-gate plot. AUROC is
+                                             averaged across all of that model's
+                                             INVARIANCE_LAYERS (not just the first).
+  - <model>__perplexity_tradeoff.png   delta-AUROC-vs-baseline (also averaged across
+                                        all invariance layers) against final
                                         validation perplexity, one point per run --
                                         the "at comparable perplexity" framing from
                                         the plan, made visual.
   - <model>__depth_profile_before_after__<run_id>.png   baseline vs. the
-    best-performing run for that model, across every layer (not just the one
-    trained against) -- shows whether training changed things only at the
-    targeted layer or more broadly.
+    best-performing run for that model, across every layer (not just the
+    invariance layers) -- shows whether training changed things only at the
+    targeted layers or more broadly; dotted red lines mark the invariance
+    layers that feed into the averaged AUROC number above.
   - ablation_summary.csv   one row per run: model, condition, lambda, test
-                            AUROC (SAE space), delta vs. baseline, final
-                            perplexity, final SAE variance explained.
+                            AUROC (SAE space, averaged over invariance layers),
+                            delta vs. baseline, final perplexity, final SAE
+                            variance explained, and which layers were averaged.
 
 Usage:
     python analyze_and_plot.py                      # everything found under results/step2_llm/
@@ -103,6 +108,16 @@ def load_final_training_metrics(log_path: str) -> dict:
     return log[-1] if log else {}
 
 
+def avg_metric_over_layers(stats: dict[int, dict], layers: list[int], metric: str = "auroc_sae"):
+    """Averages `metric` across `layers`, skipping any layer missing from `stats`.
+    Returns None if none of `layers` are present (caller should then skip the run,
+    same as the old single-layer `if layer not in stats: skip` behavior)."""
+    values = [stats[l][metric] for l in layers if l in stats]
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
 # ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
@@ -157,17 +172,17 @@ def plot_training_curves(run_id: str, log_path: str, out_dir: str) -> None:
     print(f"saved {out_path}")
 
 
-def plot_ablation_comparison(eval_files, model_key: str, invariance_layer: int, out_dir: str) -> None:
+def plot_ablation_comparison(eval_files, model_key: str, invariance_layers: list[int], out_dir: str) -> None:
     by_run = {(rid, mk): path for rid, mk, path in eval_files}
     baseline_path = by_run.get(("baseline", model_key))
     if baseline_path is None:
         print(f"[{model_key}] no baseline eval found -- run evaluate.py --run_id baseline first. Skipping.")
         return
     baseline_stats = load_layer_stats(baseline_path)
-    if invariance_layer not in baseline_stats:
-        print(f"[{model_key}] layer {invariance_layer} not in baseline eval. Skipping.")
+    baseline_auroc = avg_metric_over_layers(baseline_stats, invariance_layers)
+    if baseline_auroc is None:
+        print(f"[{model_key}] none of layers {invariance_layers} in baseline eval. Skipping.")
         return
-    baseline_auroc = baseline_stats[invariance_layer]["auroc_sae"]
 
     c1_auroc = None
     condition_lambda_auroc: dict[str, dict[float, float]] = {}
@@ -178,9 +193,9 @@ def plot_ablation_comparison(eval_files, model_key: str, invariance_layer: int, 
         if parsed_model != model_key:
             continue
         stats = load_layer_stats(path)
-        if invariance_layer not in stats:
+        auroc = avg_metric_over_layers(stats, invariance_layers)
+        if auroc is None:
             continue
-        auroc = stats[invariance_layer]["auroc_sae"]
         if condition == "C1_lm_only":
             c1_auroc = auroc
         else:
@@ -200,7 +215,7 @@ def plot_ablation_comparison(eval_files, model_key: str, invariance_layer: int, 
         ax.set_xscale("log")
     ax.set_xlabel("lambda (invariance loss weight)")
     ax.set_ylabel("test-set AUROC (SAE space, same vs. diff meaning)")
-    ax.set_title(f"H2 after training ({model_key}, layer {invariance_layer})")
+    ax.set_title(f"H2 after training ({model_key}, avg over layers {invariance_layers})")
     ax.legend()
     fig.tight_layout()
     out_path = os.path.join(out_dir, f"{model_key}__ablation_auroc_vs_lambda.png")
@@ -209,15 +224,15 @@ def plot_ablation_comparison(eval_files, model_key: str, invariance_layer: int, 
     print(f"saved {out_path}")
 
 
-def plot_perplexity_tradeoff(eval_files, training_logs, model_key: str, invariance_layer: int, out_dir: str) -> None:
+def plot_perplexity_tradeoff(eval_files, training_logs, model_key: str, invariance_layers: list[int], out_dir: str) -> None:
     by_run = {(rid, mk): path for rid, mk, path in eval_files}
     baseline_path = by_run.get(("baseline", model_key))
     if baseline_path is None:
         return
     baseline_stats = load_layer_stats(baseline_path)
-    if invariance_layer not in baseline_stats:
+    baseline_auroc = avg_metric_over_layers(baseline_stats, invariance_layers)
+    if baseline_auroc is None:
         return
-    baseline_auroc = baseline_stats[invariance_layer]["auroc_sae"]
 
     fig, ax = plt.subplots(figsize=(7, 6))
     plotted_any = False
@@ -228,13 +243,14 @@ def plot_perplexity_tradeoff(eval_files, training_logs, model_key: str, invarian
         if parsed_model != model_key:
             continue
         stats = load_layer_stats(path)
-        if invariance_layer not in stats:
+        auroc = avg_metric_over_layers(stats, invariance_layers)
+        if auroc is None:
             continue
         final_metrics = load_final_training_metrics(training_logs[run_id])
         if "perplexity" not in final_metrics:
             continue
 
-        delta_auroc = stats[invariance_layer]["auroc_sae"] - baseline_auroc
+        delta_auroc = auroc - baseline_auroc
         ppl = final_metrics["perplexity"]
         label = condition.split("_")[0] if lam is None else f"{condition.split('_')[0]},\u03bb={lam}"
         ax.scatter(ppl, delta_auroc, color=CONDITION_COLORS.get(condition, "gray"), s=60)
@@ -256,7 +272,8 @@ def plot_perplexity_tradeoff(eval_files, training_logs, model_key: str, invarian
     print(f"saved {out_path}")
 
 
-def plot_depth_profile_before_after(eval_files, model_key: str, compare_run_id: str, out_dir: str) -> None:
+def plot_depth_profile_before_after(eval_files, model_key: str, compare_run_id: str, out_dir: str,
+                                     invariance_layers: list[int] | None = None) -> None:
     by_run = {(rid, mk): path for rid, mk, path in eval_files}
     baseline_path = by_run.get(("baseline", model_key))
     compare_path = by_run.get((compare_run_id, model_key))
@@ -272,9 +289,15 @@ def plot_depth_profile_before_after(eval_files, model_key: str, compare_run_id: 
     ax.plot(rel_depth, [s["delta_auroc"] for s in baseline_stats], marker="o", color="gray", label="baseline")
     ax.plot(rel_depth, [s["delta_auroc"] for s in compare_stats], marker="o", color="tab:blue", label=compare_run_id)
     ax.axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
+    if invariance_layers:
+        layer_by_depth = {s["layer"]: s["layer"] / max(1, n_layers - 1) for s in baseline_stats}
+        for i, layer in enumerate(invariance_layers):
+            if layer in layer_by_depth:
+                ax.axvline(layer_by_depth[layer], color="tab:red", linewidth=0.8, linestyle=":",
+                           label="invariance layers" if i == 0 else None)
     ax.set_xlabel("relative layer depth")
     ax.set_ylabel("delta AUROC (SAE minus raw)")
-    ax.set_title(f"depth profile before vs. after training ({model_key})\ndid training affect layers beyond the one it targeted?")
+    ax.set_title(f"depth profile before vs. after training ({model_key})")
     ax.legend()
     fig.tight_layout()
     out_path = os.path.join(out_dir, f"{model_key}__depth_profile_before_after__{compare_run_id}.png")
@@ -296,9 +319,10 @@ def build_summary_rows(eval_files, training_logs) -> list[dict]:
         if path is None:
             continue
         stats = load_layer_stats(path)
-        layer = INVARIANCE_LAYERS[model_key][0]
-        if layer in stats:
-            baseline_auroc[model_key] = stats[layer]["auroc_sae"]
+        layers = INVARIANCE_LAYERS[model_key]
+        auroc = avg_metric_over_layers(stats, layers)
+        if auroc is not None:
+            baseline_auroc[model_key] = auroc
 
     rows = []
     for (run_id, model_key), path in by_run.items():
@@ -307,11 +331,11 @@ def build_summary_rows(eval_files, training_logs) -> list[dict]:
         parsed_model, condition, lam = parse_run_id(run_id)
         if parsed_model != model_key:
             continue
-        layer = INVARIANCE_LAYERS[model_key][0]
+        layers = INVARIANCE_LAYERS[model_key]
         stats = load_layer_stats(path)
-        if layer not in stats:
+        auroc_sae = avg_metric_over_layers(stats, layers)
+        if auroc_sae is None:
             continue
-        auroc_sae = stats[layer]["auroc_sae"]
         base = baseline_auroc.get(model_key)
         final_metrics = load_final_training_metrics(training_logs[run_id]) if run_id in training_logs else {}
         rows.append(
@@ -323,6 +347,7 @@ def build_summary_rows(eval_files, training_logs) -> list[dict]:
                 delta_vs_baseline=(auroc_sae - base) if base is not None else None,
                 final_perplexity=final_metrics.get("perplexity"),
                 final_sae_variance_explained=final_metrics.get("sae_variance_explained"),
+                invariance_layers=layers,
             )
         )
     rows.sort(key=lambda r: (r["model"], r["condition"], r["lam"] if r["lam"] is not None else -1))
@@ -334,8 +359,8 @@ def print_and_save_summary(rows: list[dict], analysis_dir: str) -> None:
         print("No completed runs found -- nothing to summarize yet.")
         return
 
-    fmt = "{:<20}{:<28}{:<8}{:<16}{:<16}{:<12}{:<14}"
-    print(fmt.format("model", "condition", "lam", "test_auroc_sae", "delta_vs_base", "final_ppl", "sae_var_expl"))
+    fmt = "{:<20}{:<28}{:<8}{:<16}{:<16}{:<12}{:<14}{:<18}"
+    print(fmt.format("model", "condition", "lam", "test_auroc_sae", "delta_vs_base", "final_ppl", "sae_var_expl", "invariance_layers"))
     for r in rows:
         print(
             fmt.format(
@@ -346,6 +371,7 @@ def print_and_save_summary(rows: list[dict], analysis_dir: str) -> None:
                 f"{r['delta_vs_baseline']:+.3f}" if r["delta_vs_baseline"] is not None else "n/a",
                 f"{r['final_perplexity']:.2f}" if r["final_perplexity"] is not None else "n/a",
                 f"{r['final_sae_variance_explained']:.3f}" if r["final_sae_variance_explained"] is not None else "n/a",
+                str(r["invariance_layers"]),
             )
         )
 
@@ -354,7 +380,7 @@ def print_and_save_summary(rows: list[dict], analysis_dir: str) -> None:
         writer = csv.DictWriter(
             f,
             fieldnames=["model", "condition", "lam", "test_auroc_sae", "delta_vs_baseline",
-                        "final_perplexity", "final_sae_variance_explained"],
+                        "final_perplexity", "final_sae_variance_explained", "invariance_layers"],
         )
         writer.writeheader()
         writer.writerows(rows)
@@ -387,9 +413,9 @@ def main() -> None:
 
     print("=== ablation comparisons ===")
     for model_key in MODEL_CONFIGS:
-        layer = INVARIANCE_LAYERS[model_key][0]
-        plot_ablation_comparison(eval_files, model_key, layer, analysis_dir)
-        plot_perplexity_tradeoff(eval_files, training_logs, model_key, layer, analysis_dir)
+        layers = INVARIANCE_LAYERS[model_key]
+        plot_ablation_comparison(eval_files, model_key, layers, analysis_dir)
+        plot_perplexity_tradeoff(eval_files, training_logs, model_key, layers, analysis_dir)
 
     print("=== summary table ===")
     rows = build_summary_rows(eval_files, training_logs)
@@ -402,7 +428,8 @@ def main() -> None:
             continue
         best = max(model_rows, key=lambda r: r["test_auroc_sae"])
         best_run_id = f"{best['model']}__{best['condition']}__lam{best['lam']}"
-        plot_depth_profile_before_after(eval_files, model_key, best_run_id, analysis_dir)
+        plot_depth_profile_before_after(eval_files, model_key, best_run_id, analysis_dir,
+                                         invariance_layers=INVARIANCE_LAYERS[model_key])
 
 
 if __name__ == "__main__":

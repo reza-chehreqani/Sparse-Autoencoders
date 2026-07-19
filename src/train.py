@@ -149,14 +149,15 @@ def run_validation_checks(
 ) -> dict:
     peft_model.eval()
 
-    layer = inv_layers[0]  # monitor the first invariance layer; training may use more than one
     val_batch = wikitext_val_batcher.next_batch(8)
-    # Piggyback on the perplexity forward pass to also get this WikiText batch's
-    # activations at the invariance layer, so the drift/sparsity diagnostics
-    # below reflect both distributions the model actually trains on, not just
-    # PAWS -- same reasoning as the training loop's anchor/regularizer terms.
+
+    # 1. Capture WikiText activations for ALL invariance layers during perplexity pass
     lm_loss_value, wikitext_acts = capture_layer_activations_during(
-        hf_model, [layer], model_family, hook_side, lambda: lm_loss(peft_model, val_batch),
+        hf_model,
+        inv_layers,                     # <-- changed from [layer] to inv_layers
+        model_family,
+        hook_side,
+        lambda: lm_loss(peft_model, val_batch),
     )
     ppl = torch.exp(lm_loss_value).item()
 
@@ -166,38 +167,53 @@ def run_validation_checks(
         a_diff=[p.sentence_a for p in val_diff_pairs],
         b_diff=[p.sentence_b for p in val_diff_pairs],
     )
-    acts = {
-        k: get_multi_layer_activations(hf_model, tokenizer, v, [layer], model_family, hook_side, device)[layer]
+    # one forward pass per sentence group, all invariance layers captured at once
+    acts_by_layer = {
+        k: get_multi_layer_activations(hf_model, tokenizer, v, inv_layers, model_family, hook_side, device)
         for k, v in sentences.items()
     }
 
-    sae = saes[layer]
-    same_cos = (
-        cosine_distance(pool_sae_codes(sae, acts["a_same"]), pool_sae_codes(sae, acts["b_same"]))
-        .cpu()
-        .numpy()
-    )
-    diff_cos = (
-        cosine_distance(pool_sae_codes(sae, acts["a_diff"]), pool_sae_codes(sae, acts["b_diff"]))
-        .cpu()
-        .numpy()
-    )
-    auroc_sae, _ = discrimination_auroc(same_cos, diff_cos)
+    per_layer = {}
+    for layer in inv_layers:
+        sae = saes[layer]
+        a_same = acts_by_layer["a_same"][layer]
+        b_same = acts_by_layer["b_same"][layer]
+        a_diff = acts_by_layer["a_diff"][layer]
+        b_diff = acts_by_layer["b_diff"][layer]
 
-    all_same_tokens = torch.cat(acts["a_same"] + acts["b_same"] + acts["a_diff"] + acts["b_diff"], dim=0)
-    wikitext_tokens_flat = wikitext_acts[layer].reshape(-1, wikitext_acts[layer].shape[-1])
-    drift_check_tokens = torch.cat([all_same_tokens, wikitext_tokens_flat], dim=0)
-    var_explained = sae.reconstruction_variance_explained(drift_check_tokens)
-    mean_l0 = sae.mean_l0(drift_check_tokens)
+        same_cos = cosine_distance(pool_sae_codes(sae, a_same), pool_sae_codes(sae, b_same)).cpu().numpy()
+        diff_cos = cosine_distance(pool_sae_codes(sae, a_diff), pool_sae_codes(sae, b_diff)).cpu().numpy()
+        auroc_sae, _ = discrimination_auroc(same_cos, diff_cos)
+
+        paws_tokens = torch.cat(a_same + b_same + a_diff + b_diff, dim=0)
+        wikitext_tokens_flat = wikitext_acts[layer].reshape(-1, wikitext_acts[layer].shape[-1])
+        drift_check_tokens = torch.cat([paws_tokens, wikitext_tokens_flat], dim=0)
+
+        var_explained = sae.reconstruction_variance_explained(drift_check_tokens)
+        mean_l0 = sae.mean_l0(drift_check_tokens)
+
+        per_layer[layer] = dict(
+            auroc_sae=float(auroc_sae),
+            same_cos=same_cos,
+            diff_cos=diff_cos,
+            var_explained=float(var_explained),
+            mean_l0=float(mean_l0),
+        )
+
+    aurocs = [v["auroc_sae"] for v in per_layer.values()]
+    same_cos_means = [v["same_cos"].mean() for v in per_layer.values()]
+    diff_cos_means = [v["diff_cos"].mean() for v in per_layer.values()]
+    var_explained_vals = [v["var_explained"] for v in per_layer.values()]
+    mean_l0_vals = [v["mean_l0"] for v in per_layer.values()]
 
     peft_model.train()
     return dict(
         perplexity=ppl,
-        auroc_sae=float(auroc_sae),
-        mean_same_sae_cos=float(same_cos.mean()),
-        mean_diff_sae_cos=float(diff_cos.mean()),
-        sae_variance_explained=float(var_explained),
-        sae_mean_l0=float(mean_l0),
+        auroc_sae=float(sum(aurocs) / len(aurocs)),
+        mean_same_sae_cos=float(sum(same_cos_means) / len(same_cos_means)),
+        mean_diff_sae_cos=float(sum(diff_cos_means) / len(diff_cos_means)),
+        sae_variance_explained=float(sum(var_explained_vals) / len(var_explained_vals)),
+        sae_mean_l0=float(sum(mean_l0_vals) / len(mean_l0_vals)),
     )
 
 
