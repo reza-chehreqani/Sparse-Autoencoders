@@ -103,17 +103,17 @@ INVARIANCE_LAYERS = {
 # use_support_term: adds the soft-support (soft-Dice) term; only meaningful for space="sae".
 CONDITION_SPECS = {
     "C1_lm_only": dict(use_invariance=False, space=None, use_bce_term=False, use_rank_term=False, use_support_term=False),
-    "C2_raw_bce": dict(use_invariance=True,  space="raw", use_bce_term=True, use_rank_term=False, use_support_term=False),
-    "C3_raw_rank": dict(use_invariance=True,  space="raw", use_bce_term=False, use_rank_term=True, use_support_term=False),
-    # "C4_raw_bce_rank": dict(use_invariance=True,  space="raw", use_bce_term=True, use_rank_term=True, use_support_term=False),
-    "C5_sae_bce": dict(use_invariance=True,  space="sae", use_bce_term=True, use_rank_term=False, use_support_term=False),
-    "C6_sae_rank": dict(use_invariance=True,  space="sae", use_bce_term=False, use_rank_term=True, use_support_term=False),
-    # "C7_sae_bce_rank": dict(use_invariance=True,  space="sae", use_bce_term=True, use_rank_term=True, use_support_term=False),
-    "C8_sae_bce_support": dict(use_invariance=True,  space="sae", use_bce_term=True, use_rank_term=False, use_support_term=True),
-    "C9_sae_rank_support": dict(use_invariance=True,  space="sae", use_bce_term=False, use_rank_term=True, use_support_term=True),
+    "C2_raw_invariance": dict(use_invariance=True,  space="raw", use_bce_term=True, use_rank_term=False, use_support_term=False),
+    # "C2_raw_invariance": dict(use_invariance=True,  space="raw", use_bce_term=False, use_rank_term=True, use_support_term=False),
+    # "C2_raw_invariance": dict(use_invariance=True,  space="raw", use_bce_term=True, use_rank_term=True, use_support_term=False),
+    "C3_sae_magnitude": dict(use_invariance=True,  space="sae", use_bce_term=True, use_rank_term=False, use_support_term=False),
+    # "C3_sae_magnitude": dict(use_invariance=True,  space="sae", use_bce_term=False, use_rank_term=True, use_support_term=False),
+    # "C3_sae_magnitude": dict(use_invariance=True,  space="sae", use_bce_term=True, use_rank_term=True, use_support_term=False),
+    "C4_sae_magnitude_support": dict(use_invariance=True,  space="sae", use_bce_term=True, use_rank_term=False, use_support_term=True),
+    # "C4_sae_magnitude_support": dict(use_invariance=True,  space="sae", use_bce_term=False, use_rank_term=True, use_support_term=True),
 }
 
-LAMBDA_GRID = [0.1, 0.5, 1.0, 2.0, 3.0, 10.0]  # swept for C2-C4; C1 has no invariance term (lambda ignored)
+LAMBDA_GRID = [0.1, 0.3, 1.0, 3.0, 10.0]  # swept for C2-C4; C1 has no invariance term (lambda ignored)
 
 PAWS_CONFIG = dict(
     hf_name="google-research-datasets/paws",
@@ -143,7 +143,7 @@ TRAIN_CONFIG = dict(
     sae_learning_rate=1e-5,      # only used with --joint_sae; deliberately much smaller than
                                    # learning_rate, since the SAE dictionary is already converged
                                    # and this is a gentle continuation, not training from scratch
-    sae_recon_loss_weight=1.0,   # RECALIBRATED, NOT YET EMPIRICALLY VERIFIED. frozen_sae.
+    sae_recon_loss_weight=10.0,   # RECALIBRATED, NOT YET EMPIRICALLY VERIFIED. frozen_sae.
                                     # FrozenSAE.training_losses' reconstruction term changed from
                                     # raw MSE to a per-token normalized (relative) error -- see
                                     # that docstring: raw MSE was found to be 70-97% of
