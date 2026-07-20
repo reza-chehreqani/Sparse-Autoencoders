@@ -113,8 +113,7 @@ CONDITION_SPECS = {
     # "C4_sae_magnitude_support": dict(use_invariance=True,  space="sae", use_bce_term=False, use_rank_term=True, use_support_term=True),
 }
 
-# LAMBDA_GRID = [0.1, 0.3, 1.0, 3.0, 10.0]  # swept for C2-C4; C1 has no invariance term (lambda ignored)
-LAMBDA_GRID = [0.01, 0.03]  # swept for C2-C4; C1 has no invariance term (lambda ignored)
+LAMBDA_GRID = [0.01, 0.03, 0.1, 0.3, 1.0]  # swept for C2-C4; C1 has no invariance term (lambda ignored)
 
 PAWS_CONFIG = dict(
     hf_name="google-research-datasets/paws",
