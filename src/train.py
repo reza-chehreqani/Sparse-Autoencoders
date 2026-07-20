@@ -412,7 +412,7 @@ def run(model_key: str, condition: str, lam: float, joint_sae: bool, sae_reg: bo
             inv_components = {}
             loss_inv_sae = torch.tensor(0.0)
             
-        total_loss = loss_lm + loss_lm_sae + lam * (loss_inv + loss_inv_sae)
+        total_loss = loss_lm + loss_lm_sae + lam * loss_inv + lam * loss_inv_sae
         # NOT `lam * (loss_inv + loss_inv_sae)` -- see the second sanity-check run
         # (gpt2-small, C1_lm_only vs C5_sae_bce lam=10): with the SAME weight=50,
         # the WikiText-side anchor (loss_lm_sae, never lambda-scaled) settled to a
