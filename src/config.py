@@ -95,7 +95,7 @@ MODEL_CONFIGS = {
 # over every layer listed.
 INVARIANCE_LAYERS = {
     "gpt2-small": [6],           # placeholder
-    "pythia-70m-deduped": [0],   # placeholder
+    "pythia-70m-deduped": [4, 5],   # placeholder
     "gemma3-270m": [9],          # placeholder -- middle of the now-confirmed 18 layers
 }
 
